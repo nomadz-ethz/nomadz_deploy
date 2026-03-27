@@ -34,7 +34,7 @@ def main():
             __import__(full_name)
         except Exception as e:
             raise e
-    from booster_deploy.utils.registry import get_task, list_tasks
+    from nomadz_deploy.utils.registry import get_task, list_tasks
 
     if args.list_tasks:
         print("Available tasks:")
@@ -56,7 +56,7 @@ def main():
     # decide how to run based on flags
     if args.mujoco:
         # run mujoco controller
-        from booster_deploy.controllers.mujoco_controller import MujocoController
+        from nomadz_deploy.controllers.mujoco_controller import MujocoController
 
         MujocoController(task_cfg).run()
     else:
@@ -78,7 +78,7 @@ def main():
             for i in ankles:
                 task_cfg.robot.joint_damping[i] = 0.5
 
-        from booster_deploy.controllers.booster_robot_controller import BoosterRobotPortal
+        from nomadz_deploy.controllers.booster_robot_controller import BoosterRobotPortal
         with BoosterRobotPortal(task_cfg, use_sim_time=args.webots) as portal:
             portal.run()
 

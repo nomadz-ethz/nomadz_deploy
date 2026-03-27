@@ -1,6 +1,6 @@
-# Booster Deploy
+# NomadZ Deploy
 
-Booster Deploy is a lightweight deployment framework that supports running control policies on Booster robots (sim2real), MuJoCo (sim2sim), and Webots (internal sim2sim). The system adopts many well-established designs from IsaacLab to provide modular abstractions, allowing unified policy execution across both simulated and real robotic platforms.
+A lightweight deployment framework that supports running control policies on Booster robots (sim2real), MuJoCo (sim2sim), and Webots (internal sim2sim). The system adopts many well-established designs from IsaacLab to provide modular abstractions, allowing unified policy execution across both simulated and real robotic platforms.
 
 
 ## Prerequisites
@@ -80,8 +80,8 @@ Booster Deploy is a lightweight deployment framework that supports running contr
 ## Repository Layout
 
 ```
-booster_deploy/
-├─ booster_deploy/           # Controllers, policies, utilities
+nomadz_deploy/
+├─ nomadz_deploy/           # Controllers, policies, utilities
 ├─ scripts/                  # Entry-point scripts (deploy.py)
 ├─ tasks/                    # Task registry and configs
 ├─ requirements.txt          # Python dependencies

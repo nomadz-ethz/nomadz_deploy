@@ -71,6 +71,13 @@ class VelocityCommandCfg:
 
 
 @configclass
+class SteeringJoystickCommandCfg:
+    vx_max: float = 2.0
+    vy_max: float = 2.0
+    vyaw_max: float = 4.0
+
+
+@configclass
 class PolicyCfg:
     constructor: Callable = MISSING
     checkpoint_path: str = MISSING
@@ -93,6 +100,7 @@ class ControllerCfg:
     policy_dt: float = 0.02
     robot: RobotCfg = MISSING
     vel_command: Optional[VelocityCommandCfg] = None
+    steering_joystick_command: SteeringJoystickCommandCfg = SteeringJoystickCommandCfg()
     policy: PolicyCfg = MISSING
 
     mujoco: MujocoControllerCfg = MujocoControllerCfg()

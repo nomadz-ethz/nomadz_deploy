@@ -3,6 +3,7 @@ torch
 mujoco
 scipy
 evdev
+pygame
 
 # Robot SDK
 # booster_robotics_sdk_python

@@ -5,6 +5,7 @@ from nomadz_deploy.utils.isaaclab.configclass import configclass
 from nomadz_deploy.controllers.controller_cfg import (
     ControllerCfg,
     MujocoControllerCfg,
+    SteeringJoystickCommandCfg,
 )
 from nomadz_deploy.robots.booster import K1_CFG
 from .mimickit_policy import MimicKitPolicyCfg
@@ -42,6 +43,11 @@ class K1MimicKitSteeringCfg(ControllerCfg):
     # Steering commands are provided directly as tar_dir(2) + speed(1)
     # + omega(1) via stdin, not via the standard velocity command path.
     vel_command = None
+    steering_joystick_command = SteeringJoystickCommandCfg(
+        vx_max=2.0,
+        vy_max=2.0,
+        vyaw_max=1.5,
+    )
 
     policy: MimicKitPolicyCfg = MimicKitPolicyCfg(
         checkpoint_path=CHECKPOINT_PATH,

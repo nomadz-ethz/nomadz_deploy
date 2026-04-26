@@ -160,6 +160,7 @@ class LocomotionPolicyCfg(PolicyCfg):
     action_scale: float = 0.25
     obs_dof_vel_scale: float = 1.0
     policy_joint_names: list[str] = MISSING  # type: ignore
+    enable_safety_fallback: bool = False
 
 
 @configclass
@@ -188,9 +189,9 @@ class K1WalkControllerCfg(ControllerCfg):
         ],
     )
     vel_command: VelocityCommandCfg = VelocityCommandCfg(
-        vx_max=1.0,
+        vx_max=2.0,
         vy_max=1.0,
-        vyaw_max=1.0,
+        vyaw_max=3.0,
     )
     policy: LocomotionPolicyCfg = LocomotionPolicyCfg(
         obs_dof_vel_scale=0.1,
@@ -248,9 +249,9 @@ class T1WalkControllerCfg(ControllerCfg):
         ],
     )
     vel_command: VelocityCommandCfg = VelocityCommandCfg(
-        vx_max=1.0,
+        vx_max=2.0,
         vy_max=1.0,
-        vyaw_max=1.0,
+        vyaw_max=3.0,
     )
     policy: LocomotionPolicyCfg = LocomotionPolicyCfg(
         obs_dof_vel_scale=1.0,

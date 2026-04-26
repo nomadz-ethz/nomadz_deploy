@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import sys
 import atexit
 from time import sleep
@@ -8,18 +6,90 @@ import numpy as np
 import torch
 import mujoco
 import mujoco.viewer
+import warnings
 from booster_assets import BOOSTER_ASSETS_DIR
 from .base_controller import BaseController, ControllerCfg, VelocityCommand
 
+# Suppress pygame warnings before importing joystick handler
+warnings.filterwarnings("ignore", message=".*pkg_resources.*", category=UserWarning)
+from ..utils.joystick_handler import JoystickHandler
+
+
+def render_velocity_bars(
+    vx: float,
+    vy: float,
+    vyaw: float,
+    vx_max: float,
+    vy_max: float,
+    vyaw_max: float,
+    bar_width: int = 30,
+) -> str:
+    """Render velocity commands as a fixed multi-line text block."""
+
+    def create_bar(value: float, max_val: float, width: int) -> str:
+        normalized = value / max_val if max_val != 0 else 0.0
+        normalized = max(-1.0, min(1.0, normalized))
+
+        center_pos = width // 2
+        fill_positions = int(round(abs(normalized) * center_pos))
+
+        cells = ["░"] * width
+        cells[center_pos] = "│"
+
+        if normalized > 0:
+            for idx in range(center_pos + 1, min(width, center_pos + 1 + fill_positions)):
+                cells[idx] = "█"
+        elif normalized < 0:
+            start = max(0, center_pos - fill_positions)
+            for idx in range(start, center_pos):
+                cells[idx] = "█"
+
+        return "".join(cells)
+
+    def render_axis(name: str, value: float, max_val: float) -> list[str]:
+        labels = f"{-max_val:>6.1f}{' ' * max(1, bar_width - 12)}{max_val:>6.1f}"
+        return [
+            f"{name:<5}{value:>7.2f}",
+            create_bar(value, max_val, bar_width),
+            labels,
+        ]
+
+    lines = []
+    for axis_name, axis_value, axis_max in (
+        ("Vx", vx, vx_max),
+        ("Vy", vy, vy_max),
+        ("Vyaw", vyaw, vyaw_max),
+    ):
+        if lines:
+            lines.append("")
+        lines.extend(render_axis(axis_name, axis_value, axis_max))
+    return "\n".join(lines)
+
 
 class MujocoController(BaseController):
-    def __init__(self, cfg: ControllerCfg):
+    def __init__(self, cfg: ControllerCfg, joystick_enabled: bool = False):
         # Create MuJoCo model before super().__init__ so that policies
         # constructed during base init can access self.mj_model.
         mjcf_path = self._expand_assets_placeholder_static(cfg.robot.mjcf_path)
         self.mj_model = mujoco.MjModel.from_xml_path(mjcf_path)
 
         super().__init__(cfg)
+        self.joystick_enabled = joystick_enabled
+        self._joystick_display_initialized = False
+
+        # Initialize joystick if enabled
+        self.joystick_handler = None
+        if self.joystick_enabled:
+            try:
+                self.joystick_handler = JoystickHandler()
+                self.joystick_handler.calibrate()
+                self.joystick_handler.start()
+                print("Joystick control enabled and calibrated.")
+            except Exception as e:
+                print(f"Failed to initialize joystick: {e}")
+                print("Falling back to keyboard input.")
+                self.joystick_enabled = False
+
         self.mj_model.opt.timestep = self.cfg.mujoco.physics_dt
         self.decimation = self.cfg.mujoco.decimation
 
@@ -141,6 +211,18 @@ class MujocoController(BaseController):
 
     def update_vel_command(self):
         cmd: VelocityCommand = self.vel_command
+
+        # Use joystick if available
+        if self.joystick_enabled and self.joystick_handler:
+            vx, vy, vyaw = self.joystick_handler.get_velocities(
+                cmd.vx_max, cmd.vy_max, cmd.vyaw_max
+            )
+            cmd.lin_vel_x = vx
+            cmd.lin_vel_y = vy
+            cmd.ang_vel_yaw = vyaw
+            return
+
+        # Fallback to keyboard input
         if select.select([sys.stdin], [], [], 0)[0]:
             try:
                 parts = sys.stdin.readline().strip().split()
@@ -162,8 +244,37 @@ class MujocoController(BaseController):
                 )
 
     def update_steering_command(self):
-        """Read steering commands from stdin: tar_dir_x tar_dir_y speed [omega]"""
+        """Read steering commands from joystick or stdin: tar_dir_x tar_dir_y speed [omega]"""
         import torch
+
+        # Use joystick if available
+        if self.joystick_enabled and self.joystick_handler:
+            joystick_cfg = self.cfg.steering_joystick_command
+            vx, vy, vyaw = self.joystick_handler.get_velocities(
+                joystick_cfg.vx_max,
+                joystick_cfg.vy_max,
+                joystick_cfg.vyaw_max,
+            )
+
+            # Convert to steering commands
+            # Left stick gives direction and speed
+            speed = (vx**2 + vy**2)**0.5
+            if speed > 0:
+                # Normalize direction
+                dir_x = vx / speed
+                dir_y = vy / speed
+            else:
+                dir_x, dir_y = 1.0, 0.0  # Default forward
+
+            speed = min(speed, joystick_cfg.vx_max)
+            omega = vyaw
+
+            self.policy.tar_dir = torch.tensor([dir_x, dir_y], dtype=torch.float32)
+            self.policy.tar_speed = torch.tensor([speed], dtype=torch.float32)
+            self.policy.tar_omega = torch.tensor([omega], dtype=torch.float32)
+            return
+
+        # Fallback to keyboard input
         if select.select([sys.stdin], [], [], 0)[0]:
             try:
                 parts = sys.stdin.readline().strip().split()
@@ -327,10 +438,31 @@ class MujocoController(BaseController):
 
                 self.viewer = viewer
                 viewer.cam.elevation = -20
-                if self.vel_command is not None:
-                    print("\nSet command (x, y, yaw): ", end="")
-                elif hasattr(self.policy, 'tar_dir'):
-                    print("\nSet command (tar_dir_x, tar_dir_y, speed [omega]): ", end="")
+                if not self.joystick_enabled:
+                    if self.vel_command is not None:
+                        print("\nSet command (x, y, yaw): ", end="")
+                    elif hasattr(self.policy, 'tar_dir'):
+                        print("\nSet command (tar_dir_x, tar_dir_y, speed [omega]): ", end="")
+                else:
+                    print("\nJoystick Control Active:")
+                    print("  Left Stick: ↑↓ Forward/Back | ←→ Left/Right")
+                    if self.vel_command is not None:
+                        print("  Right Stick: ←→ Turn Left/Right")
+                    elif hasattr(self.policy, 'tar_dir'):
+                        print("  Right Stick: ←→ Yaw Left/Right")
+                    print("  Use controller to teleoperate robot.")
+                    print("")
+                    print("")
+                    print("")
+                    print("")
+                    print("")
+                    print("")
+                    print("")
+                    print("")
+                    print("")
+                    print("")
+                    print("")
+                    self._joystick_display_initialized = True
                 self.update_state()
                 self.start()
                 while viewer.is_running() and self.is_running:
@@ -338,6 +470,39 @@ class MujocoController(BaseController):
                     self.update_state()
                     dof_targets = self.policy_step()
                     self.ctrl_step(dof_targets)
+
+                    # Display velocity bars if joystick is enabled
+                    if self.joystick_enabled:
+                        if self._joystick_display_initialized:
+                            print("\033[11A", end="")
+                        if self.vel_command is not None:
+                            print(render_velocity_bars(
+                                self.vel_command.lin_vel_x,
+                                self.vel_command.lin_vel_y,
+                                self.vel_command.ang_vel_yaw,
+                                self.vel_command.vx_max,
+                                self.vel_command.vy_max,
+                                self.vel_command.vyaw_max
+                            ))
+                        elif hasattr(self.policy, 'tar_dir'):
+                            speed = float(self.policy.tar_speed.item()) if hasattr(self.policy.tar_speed, 'item') else float(self.policy.tar_speed)
+                            omega = float(self.policy.tar_omega.item()) if hasattr(self.policy.tar_omega, 'item') else float(self.policy.tar_omega)
+                            dir_x = float(self.policy.tar_dir[0].item()) if hasattr(self.policy.tar_dir[0], 'item') else float(self.policy.tar_dir[0])
+                            dir_y = float(self.policy.tar_dir[1].item()) if hasattr(self.policy.tar_dir[1], 'item') else float(self.policy.tar_dir[1])
+
+                            vx = speed * dir_x
+                            vy = speed * dir_y
+                            vyaw = omega
+
+                            joystick_cfg = self.cfg.steering_joystick_command
+                            print(render_velocity_bars(
+                                vx,
+                                vy,
+                                vyaw,
+                                joystick_cfg.vx_max,
+                                joystick_cfg.vy_max,
+                                joystick_cfg.vyaw_max,
+                            ))
 
                     if self.cfg.mujoco.visualize_reference_ghost:
                         # Render kinematic "ghost" robot from generalized coordinates.
@@ -352,3 +517,5 @@ class MujocoController(BaseController):
             self._flush_logged_states()
             if hasattr(self.policy, 'flush_policy_log_if_enabled'):
                 self.policy.flush_policy_log_if_enabled()
+            if self.joystick_handler:
+                self.joystick_handler.stop()

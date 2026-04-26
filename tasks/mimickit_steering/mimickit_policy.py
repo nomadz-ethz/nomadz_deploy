@@ -30,7 +30,7 @@ from nomadz_deploy.utils.isaaclab.configclass import configclass
 from .jit_policy import JitPolicy, JitPolicyCfg
 
 
-MIN_TARGET_SPEED_MPS = 0.5
+MIN_TARGET_SPEED_MPS = 0.0
 MAX_TARGET_SPEED_MPS = 2.0
 DEFAULT_TARGET_SPEED_MPS = MIN_TARGET_SPEED_MPS
 MIN_TARGET_OMEGA_RAD_S = -1.5

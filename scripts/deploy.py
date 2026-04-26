@@ -1,6 +1,10 @@
 import argparse
 import os
 import sys
+import warnings
+
+# Suppress pygame warnings globally
+warnings.filterwarnings("ignore", message=".*pkg_resources.*", category=UserWarning)
 
 sys.path.append(".")
 
@@ -17,6 +21,18 @@ parser.add_argument("--mujoco", action="store_true", default=False,
                     help="deploy in mujoco simulation")
 parser.add_argument("--webots", action="store_true", default=False,
                     help="deploy in webots simulation")
+parser.add_argument(
+    "--joystick", action="store_true", default=False,
+    help="Enable joystick control for teleoperation")
+parser.add_argument(
+    "--vx-max", type=float, default=None,
+    help="Override joystick max forward velocity.")
+parser.add_argument(
+    "--vy-max", type=float, default=None,
+    help="Override joystick max lateral velocity.")
+parser.add_argument(
+    "--vyaw-max", type=float, default=None,
+    help="Override joystick max yaw velocity.")
 parser.add_argument(
     "--device", type=str, default="cpu",
     help="Device to run the evaluation on (e.g., 'cpu', 'cuda')")
@@ -69,12 +85,28 @@ def main():
     # Set device for policy
     task_cfg.policy.device = args.device
 
+    if args.joystick:
+        if task_cfg.vel_command is not None:
+            if args.vx_max is not None:
+                task_cfg.vel_command.vx_max = args.vx_max
+            if args.vy_max is not None:
+                task_cfg.vel_command.vy_max = args.vy_max
+            if args.vyaw_max is not None:
+                task_cfg.vel_command.vyaw_max = args.vyaw_max
+        elif hasattr(task_cfg, "steering_joystick_command"):
+            if args.vx_max is not None:
+                task_cfg.steering_joystick_command.vx_max = args.vx_max
+            if args.vy_max is not None:
+                task_cfg.steering_joystick_command.vy_max = args.vy_max
+            if args.vyaw_max is not None:
+                task_cfg.steering_joystick_command.vyaw_max = args.vyaw_max
+
     # decide how to run based on flags
     if args.mujoco:
         # run mujoco controller
         from nomadz_deploy.controllers.mujoco_controller import MujocoController
 
-        MujocoController(task_cfg).run()
+        MujocoController(task_cfg, joystick_enabled=args.joystick).run()
     else:
         # initialize network and run robot portal
         try:

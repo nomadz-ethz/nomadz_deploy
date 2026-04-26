@@ -478,8 +478,8 @@ class MujocoController(BaseController):
                         if self.vel_command is not None:
                             print(render_velocity_bars(
                                 self.vel_command.lin_vel_x,
-                                self.vel_command.lin_vel_y,
-                                self.vel_command.ang_vel_yaw,
+                                -self.vel_command.lin_vel_y,
+                                -self.vel_command.ang_vel_yaw,
                                 self.vel_command.vx_max,
                                 self.vel_command.vy_max,
                                 self.vel_command.vyaw_max
@@ -497,8 +497,8 @@ class MujocoController(BaseController):
                             joystick_cfg = self.cfg.steering_joystick_command
                             print(render_velocity_bars(
                                 vx,
-                                vy,
-                                vyaw,
+                                -vy,
+                                -vyaw,
                                 joystick_cfg.vx_max,
                                 joystick_cfg.vy_max,
                                 joystick_cfg.vyaw_max,

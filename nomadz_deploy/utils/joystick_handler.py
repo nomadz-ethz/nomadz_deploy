@@ -126,11 +126,11 @@ class JoystickHandler:
         # Left stick Y: forward/backward (negative Y is forward in pygame)
         forward_vel = -self.left_stick_y * vx_max
 
-        # Left stick X: left/right
-        lateral_vel = self.left_stick_x * vy_max
+        # Left stick X: left/right, inverted to match desired robot motion
+        lateral_vel = -self.left_stick_x * vy_max
 
-        # Right stick X: yaw (right = positive yaw, left = negative yaw)
-        yaw_vel = self.right_stick_x * vyaw_max
+        # Right stick X: yaw, inverted to match desired robot motion
+        yaw_vel = -self.right_stick_x * vyaw_max
 
         return forward_vel, lateral_vel, yaw_vel
 

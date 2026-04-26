@@ -41,6 +41,28 @@ Booster Deploy is a lightweight deployment framework that supports running contr
    python scripts/deploy.py --task <TASK_NAME> --mujoco
    ```
 
+- Enable joystick teleoperation in MuJoCo with a connected gamepad:
+   ```bash
+   python scripts/deploy.py --task <TASK_NAME> --mujoco --joystick
+   ```
+
+- Override joystick command limits from the CLI:
+   ```bash
+   python scripts/deploy.py --task <TASK_NAME> --mujoco --joystick --vx-max 2.0 --vy-max 1.0 --vyaw-max 3.0
+   ```
+
+- Notes for joystick mode:
+   - Left stick controls forward/backward and lateral motion.
+   - Right stick left/right controls yaw.
+   - Locomotion tasks use their `vel_command` limits by default.
+   - `k1_mimickit_steering` also supports `--joystick` and uses its steering joystick limits by default.
+
+- Example commands:
+   ```bash
+   python scripts/deploy.py --task t1_walk --mujoco --joystick
+   python scripts/deploy.py --task k1_mimickit_steering --mujoco --joystick --vx-max 1.5 --vy-max 1.0 --vyaw-max 1.2
+   ```
+
 ### Run Sim2Real (Real Robots)
 
 **IMPORTANT**: Make sure to install [Booster Firmware](https://booster.feishu.cn/wiki/E3q5wF5SnitXZgkY18Uc8odBnXb) >= v1.4 on the robot before proceeding.

@@ -1,5 +1,5 @@
-from booster_deploy.utils.registry import register_task
-from booster_deploy.utils.isaaclab.configclass import configclass
+from nomadz_deploy.utils.registry import register_task
+from nomadz_deploy.utils.isaaclab.configclass import configclass
 from .beyond_mimic import K1BeyondMimicControllerCfg
 
 

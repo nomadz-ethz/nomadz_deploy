@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 
 sys.path.append(".")
@@ -19,10 +20,25 @@ parser.add_argument("--webots", action="store_true", default=False,
 parser.add_argument(
     "--device", type=str, default="cpu",
     help="Device to run the evaluation on (e.g., 'cpu', 'cuda')")
+parser.add_argument(
+    "--log-stem",
+    type=str,
+    default=None,
+    help=(
+        "Path stem for debug logs. Example: --log-stem logs/k1_debug "
+        "writes logs/k1_debug.npz (MuJoCo state) and "
+        "logs/k1_debug_policy.npz (policy trace)."
+    ),
+)
 args = parser.parse_args()
 
 
 def main():
+    # Optional: enable MimicKit steering debug logs without requiring manual
+    # environment variable export.
+    if args.log_stem:
+        os.environ["MIMICKIT_STEERING_LOG_PATH"] = args.log_stem
+
     # load task registry and dispatch
     import pkgutil
     import tasks as tasks_pkg

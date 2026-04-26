@@ -4,6 +4,10 @@ tasks/*/motions/
 
 .DS_Store
 
+# Ignore booster_assets and logs
+booster_assets/
+logs/
+
 # Common Python temporary files
 __pycache__/
 *.pyc

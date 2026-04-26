@@ -1,5 +1,5 @@
-from booster_deploy.utils.isaaclab.configclass import configclass
-from booster_deploy.utils.registry import register_task
+from nomadz_deploy.utils.isaaclab.configclass import configclass
+from nomadz_deploy.utils.registry import register_task
 from .locomotion import (
     K1WalkControllerCfg,
     T1WalkControllerCfg

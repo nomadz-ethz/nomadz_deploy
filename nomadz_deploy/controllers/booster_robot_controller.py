@@ -534,22 +534,25 @@ class BoosterRobotController(BaseController):
         self.portal.exit_event.set()
 
     def run(self):
-        self.update_state()
-        if self.vel_command is not None:
-            self.update_vel_command()
-        self.start()
-        next_inference_time = self.portal.timer.get_time()
-        while self.is_running and not self.portal.exit_event.is_set():
-            if self.portal.timer.get_time() < next_inference_time:
-                time.sleep(0.0002)
-                continue
-            next_inference_time += self.cfg.policy_dt
-
+        try:
             self.update_state()
             if self.vel_command is not None:
                 self.update_vel_command()
-            self.portal.metrics["policy_step"].mark()
-            dof_targets = self.policy_step()
-            self.ctrl_step(dof_targets)
+            self.start()
+            next_inference_time = self.portal.timer.get_time()
+            while self.is_running and not self.portal.exit_event.is_set():
+                if self.portal.timer.get_time() < next_inference_time:
+                    time.sleep(0.0002)
+                    continue
+                next_inference_time += self.cfg.policy_dt
 
-        self.portal.exit_event.set()
+                self.update_state()
+                if self.vel_command is not None:
+                    self.update_vel_command()
+                self.portal.metrics["policy_step"].mark()
+                dof_targets = self.policy_step()
+                self.ctrl_step(dof_targets)
+        finally:
+            self.portal.exit_event.set()
+            if hasattr(self.policy, "flush_policy_log_if_enabled"):
+                self.policy.flush_policy_log_if_enabled()

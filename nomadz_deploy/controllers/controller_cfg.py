@@ -19,6 +19,9 @@ class MujocoControllerCfg:
     decimation: int = 10
     # physics_dt will automatically be set by ControllerCfg
     physics_dt: float = None  # type: ignore
+    # Ground geom friction [sliding, torsional, rolling]. Overrides the
+    # MJCF value at load time so deployment is reproducible across assets.
+    ground_friction: List[float] = [1.0, 0.005, 0.0001]
     log_states: Optional[str] = None
     visualize_reference_ghost: bool = False
     ghost_rgba: List[float] = [0.2, 0.8, 0.2, 0.25]

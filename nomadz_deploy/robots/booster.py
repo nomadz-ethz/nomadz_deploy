@@ -59,12 +59,16 @@ K1_CFG = RobotCfg(
         80., 80.0, 80., 80., 30., 30.,
         80., 80.0, 80., 80., 30., 30.,
     ],
+    # External kd zeroed: damping is now sourced from the MJCF joint-level
+    # damping attributes (K1_22dof.xml) so MuJoCo's implicitfast integrator
+    # can apply it implicitly, matching IsaacLab's ImplicitActuator behavior
+    # used during A023 training.
     joint_damping=[
-        1., 1.,
-        1., 1., 1., 1.,
-        1., 1., 1., 1.,
-        2., 2., 2., 2., 2., 2.,
-        2., 2., 2., 2., 2., 2.,
+        0., 0.,
+        0., 0., 0., 0.,
+        0., 0., 0., 0.,
+        0., 0., 0., 0., 0., 0.,
+        0., 0., 0., 0., 0., 0.,
     ],
     default_joint_pos=[
         0, 0,

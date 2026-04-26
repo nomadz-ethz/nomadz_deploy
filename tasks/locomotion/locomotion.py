@@ -3,13 +3,16 @@ from dataclasses import MISSING
 import os
 import torch
 
-from booster_deploy.controllers.base_controller import BaseController, Policy
-from booster_deploy.controllers.controller_cfg import (
+from nomadz_deploy.controllers.base_controller import BaseController, Policy
+from nomadz_deploy.controllers.controller_cfg import (
     ControllerCfg, PolicyCfg, VelocityCommandCfg
 )
-from booster_deploy.robots.booster import K1_CFG, T1_23DOF_CFG
-from booster_deploy.utils.isaaclab.configclass import configclass
-from booster_deploy.utils.isaaclab import math as lab_math
+from nomadz_deploy.robots.booster import K1_CFG, T1_23DOF_CFG
+from nomadz_deploy.utils.joint_trace_plotter import (
+    JointTracePlotHelper, resolve_policy_trace_stem
+)
+from nomadz_deploy.utils.isaaclab.configclass import configclass
+from nomadz_deploy.utils.isaaclab import math as lab_math
 
 
 class LocomotionPolicy(Policy):
@@ -43,10 +46,17 @@ class LocomotionPolicy(Policy):
             self.robot.cfg.joint_names.index(name)
             for name in self.cfg.policy_joint_names
         ], dtype=torch.long)
+        self._joint_trace_plotter = JointTracePlotHelper(
+            output_stem=resolve_policy_trace_stem(),
+            joint_names=self.cfg.policy_joint_names,
+            title="Locomotion Policy Joint Tracking",
+        )
 
     def reset(self) -> None:
         """Initialize policy state."""
-        pass
+        self.obs_history = None
+        self.last_action.zero_()
+        self._joint_trace_plotter.reset()
 
     def compute_observation(self) -> torch.Tensor:
         """Compute current observation following sim2sim.py pattern."""
@@ -131,7 +141,15 @@ class LocomotionPolicy(Policy):
             self.real2sim_joint_map,
             action * self.action_scale,
             reduce='sum')
+        self._joint_trace_plotter.record(
+            time_s=self.controller._elapsed_s,
+            actual_joint_pos=self.robot.data.joint_pos[self.real2sim_joint_map],
+            target_joint_pos=dof_targets[self.real2sim_joint_map],
+        )
         return dof_targets
+
+    def flush_policy_log_if_enabled(self) -> None:
+        self._joint_trace_plotter.flush()
 
 
 @configclass

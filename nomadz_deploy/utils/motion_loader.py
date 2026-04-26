@@ -2,7 +2,7 @@ import os
 from typing import Sequence
 import numpy as np
 import torch
-from booster_deploy.utils.isaaclab import math as lab_math
+from nomadz_deploy.utils.isaaclab import math as lab_math
 
 
 class MotionLoader:

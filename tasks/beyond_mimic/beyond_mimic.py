@@ -4,16 +4,16 @@ import os
 import inspect
 import torch
 
-from booster_deploy.controllers.base_controller import BaseController, Policy
-from booster_deploy.controllers.controller_cfg import (
+from nomadz_deploy.controllers.base_controller import BaseController, Policy
+from nomadz_deploy.controllers.controller_cfg import (
     ControllerCfg,
     MujocoControllerCfg,
     PolicyCfg
 )
-from booster_deploy.robots.booster import K1_CFG
-from booster_deploy.utils.isaaclab.configclass import configclass
-from booster_deploy.utils.isaaclab import math as lab_math
-from booster_deploy.utils.motion_loader import MotionLoader
+from nomadz_deploy.robots.booster import K1_CFG
+from nomadz_deploy.utils.isaaclab.configclass import configclass
+from nomadz_deploy.utils.isaaclab import math as lab_math
+from nomadz_deploy.utils.motion_loader import MotionLoader
 
 
 class BeyondMimicPolicy(Policy):

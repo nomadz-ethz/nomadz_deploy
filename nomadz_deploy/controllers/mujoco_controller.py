@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import atexit
 from time import sleep
 import select
 import numpy as np
@@ -13,12 +14,26 @@ from .base_controller import BaseController, ControllerCfg, VelocityCommand
 
 class MujocoController(BaseController):
     def __init__(self, cfg: ControllerCfg):
-        super().__init__(cfg)
-
-        mjcf_path = self._expand_assets_placeholder(self.robot.cfg.mjcf_path)
+        # Create MuJoCo model before super().__init__ so that policies
+        # constructed during base init can access self.mj_model.
+        mjcf_path = self._expand_assets_placeholder_static(cfg.robot.mjcf_path)
         self.mj_model = mujoco.MjModel.from_xml_path(mjcf_path)
+
+        super().__init__(cfg)
         self.mj_model.opt.timestep = self.cfg.mujoco.physics_dt
         self.decimation = self.cfg.mujoco.decimation
+
+        self._use_native_pd = False
+
+        # Fix ground contact: ensure friction is enabled (condim>=3)
+        # and set friction to reasonable value for walking.
+        ground_id = mujoco.mj_name2id(
+            self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, "ground"
+        )
+        if ground_id >= 0:
+            self.mj_model.geom_condim[ground_id] = 3
+            self.mj_model.geom_friction[ground_id] = [1.0, 0.005, 0.0001]
+
         self.mj_data = mujoco.MjData(self.mj_model)
         mujoco.mj_resetData(self.mj_model, self.mj_data)
 
@@ -47,6 +62,12 @@ class MujocoController(BaseController):
 
         # Reference qpos can be set explicitly by the policy.
         self._reference_qpos: np.ndarray | None = None
+
+        # Logging buffers are initialized lazily in log_states().
+        self._states: dict[str, list[np.ndarray]] | None = None
+        self._last_log_flush_step: int = 0
+        # Ensure logs are flushed if the process exits unexpectedly.
+        atexit.register(self._flush_logged_states)
 
     def start(self):
         # Clear reference; policy.reset() may set a fresh one.
@@ -105,13 +126,18 @@ class MujocoController(BaseController):
         self._ghost_mj_data.qvel[:] = 0.0
         mujoco.mj_forward(self.mj_model, self._ghost_mj_data)
 
-    def _expand_assets_placeholder(self, path: str) -> str:
-        """Replace {BOOSTER_ASSETS_DIR} placeholder in a path string.
-        """
+    @staticmethod
+    def _expand_assets_placeholder_static(path: str) -> str:
+        """Replace {BOOSTER_ASSETS_DIR} placeholder in a path string."""
         try:
             return path.replace("{BOOSTER_ASSETS_DIR}", str(BOOSTER_ASSETS_DIR))
         except Exception:
             return path
+
+    def _expand_assets_placeholder(self, path: str) -> str:
+        """Replace {BOOSTER_ASSETS_DIR} placeholder in a path string.
+        """
+        return self._expand_assets_placeholder_static(path)
 
     def update_vel_command(self):
         cmd: VelocityCommand = self.vel_command
@@ -135,15 +161,54 @@ class MujocoController(BaseController):
                     end="",
                 )
 
+    def update_steering_command(self):
+        """Read steering commands from stdin: tar_dir_x tar_dir_y speed [omega]"""
+        import torch
+        if select.select([sys.stdin], [], [], 0)[0]:
+            try:
+                parts = sys.stdin.readline().strip().split()
+                if len(parts) in (3, 4):
+                    tx, ty, spd = map(float, parts[:3])
+                    omega = float(parts[3]) if len(parts) == 4 else 0.0
+                    self.policy.tar_dir = torch.tensor([tx, ty], dtype=torch.float32)
+                    self.policy.tar_speed = torch.tensor([spd], dtype=torch.float32)
+                    self.policy.tar_omega = torch.tensor([omega], dtype=torch.float32)
+                    print(
+                        f"Updated: tar_dir=[{tx}, {ty}], speed={spd}, "
+                        f"omega={omega}\n"
+                        "Set command (tar_dir_x, tar_dir_y, speed [omega]): ",
+                        end="",
+                    )
+                else:
+                    raise ValueError
+            except (ValueError, AttributeError):
+                print(
+                    "Invalid input. Enter 3 values (tar_dir_x, tar_dir_y, speed) "
+                    "or 4 values (+ omega).\n"
+                    "Set command (tar_dir_x, tar_dir_y, speed [omega]): ",
+                    end="",
+                )
+
     def update_state(self) -> None:
         dof_pos = self.mj_data.qpos.astype(np.float32)[7:]
         dof_vel = self.mj_data.qvel.astype(np.float32)[6:]
         dof_torque = self.mj_data.qfrc_actuator[6:].astype(np.float32)
 
         base_pos_w = self.mj_data.qpos.astype(np.float32)[:3]
-        base_quat = self.mj_data.qpos.astype(np.float32)[3:7]
-        base_lin_vel_b = self.mj_data.qvel.astype(np.float32)[:3]
+        base_quat_wxyz = self.mj_data.qpos.astype(np.float32)[3:7]
+        # MuJoCo free joint: qvel[0:3] is linear vel in world frame,
+        # qvel[3:6] is angular vel in body frame.
+        base_lin_vel_w = self.mj_data.qvel.astype(np.float32)[:3]
         base_ang_vel_b = self.mj_data.qvel.astype(np.float32)[3:6]
+
+        # Convert world-frame linear velocity to body frame using
+        # inverse (conjugate) rotation of the base quaternion.
+        w, x, y, z = base_quat_wxyz
+        # Rotate by conjugate quat (w, -x, -y, -z) in wxyz convention:
+        # v_body = q_conj * v_world * q
+        qv = np.array([-x, -y, -z], dtype=np.float32)
+        t = 2.0 * np.cross(qv, base_lin_vel_w)
+        base_lin_vel_b = base_lin_vel_w + w * t + np.cross(qv, t)
 
         self.robot.data.joint_pos = torch.from_numpy(
             dof_pos).to(self.robot.data.device)
@@ -154,7 +219,7 @@ class MujocoController(BaseController):
         self.robot.data.root_pos_w = torch.from_numpy(
             base_pos_w).to(self.robot.data.device)
         self.robot.data.root_quat_w = torch.from_numpy(
-            base_quat).to(self.robot.data.device)
+            base_quat_wxyz).to(self.robot.data.device)
         self.robot.data.root_lin_vel_b = torch.from_numpy(
             base_lin_vel_b).to(self.robot.data.device)
         self.robot.data.root_ang_vel_b = torch.from_numpy(
@@ -162,88 +227,128 @@ class MujocoController(BaseController):
 
     def log_states(self, dof_targets: np.ndarray) -> None:
         if self.cfg.mujoco.log_states is not None:
-            if not hasattr(self, '_states'):
+            if self._states is None:
                 self._states = {
+                    'step': [],
+                    'sim_time_s': [],
                     'root_pos_w': [],
                     'root_quat_w': [],
+                    'root_lin_vel_w': [],
                     'root_lin_vel_b': [],
                     'root_ang_vel_b': [],
                     'joint_pos': [],
                     'joint_vel': [],
                     'joint_torque': [],
+                    'ctrl_applied': [],
                     'dof_targets': [],
                 }
             base_pos_w = self.mj_data.qpos.astype(np.float32)[:3]
-            base_quat = self.mj_data.qpos.astype(np.float32)[3:7]
-            base_lin_vel_b = self.mj_data.qvel.astype(np.float32)[:3]
+            base_quat_wxyz = self.mj_data.qpos.astype(np.float32)[3:7]
+            base_lin_vel_w = self.mj_data.qvel.astype(np.float32)[:3]
             base_ang_vel_b = self.mj_data.qvel.astype(np.float32)[3:6]
+
+            # Convert world-frame linear velocity to body frame using
+            # inverse (conjugate) rotation of the base quaternion.
+            w, x, y, z = base_quat_wxyz
+            qv = np.array([-x, -y, -z], dtype=np.float32)
+            t = 2.0 * np.cross(qv, base_lin_vel_w)
+            base_lin_vel_b = base_lin_vel_w + w * t + np.cross(qv, t)
+
             dof_pos = self.mj_data.qpos.astype(np.float32)[7:]
             dof_vel = self.mj_data.qvel.astype(np.float32)[6:]
             dof_torque = self.mj_data.qfrc_actuator[6:].astype(np.float32)
+            ctrl_applied = self.mj_data.ctrl.astype(np.float32).copy()
 
+            self._states['step'].append(np.array([self._step_count], dtype=np.float32))
+            self._states['sim_time_s'].append(np.array([self._elapsed_s], dtype=np.float32))
             self._states['root_pos_w'].append(base_pos_w)
-            self._states['root_quat_w'].append(base_quat)
+            self._states['root_quat_w'].append(base_quat_wxyz)
+            self._states['root_lin_vel_w'].append(base_lin_vel_w)
             self._states['root_lin_vel_b'].append(base_lin_vel_b)
             self._states['root_ang_vel_b'].append(base_ang_vel_b)
             self._states['joint_pos'].append(dof_pos)
             self._states['joint_vel'].append(dof_vel)
             self._states['joint_torque'].append(dof_torque)
+            self._states['ctrl_applied'].append(ctrl_applied)
             self._states['dof_targets'].append(dof_targets)
             if len(self._states['root_pos_w']) % 100 == 0:
-                _states = {k: np.stack(v) for k, v in self._states.items()}
-                np.savez(f'{self.cfg.mujoco.log_states}.npz', **_states)
-                print(f'saved {self.cfg.mujoco.log_states}.npz '
-                      f'at {self._step_count} steps')
+                self._flush_logged_states()
+
+    def _flush_logged_states(self) -> None:
+        if self.cfg.mujoco.log_states is None or self._states is None:
+            return
+        num_entries = len(self._states['root_pos_w'])
+        if num_entries == 0 or num_entries == self._last_log_flush_step:
+            return
+        stacked = {k: np.stack(v) for k, v in self._states.items()}
+        np.savez(f'{self.cfg.mujoco.log_states}.npz', **stacked)
+        self._last_log_flush_step = num_entries
+        print(
+            f'saved {self.cfg.mujoco.log_states}.npz '
+            f'with {num_entries} control steps'
+        )
 
     def ctrl_step(self, dof_targets: torch.Tensor):
         dof_targets = dof_targets.cpu().numpy()  # type: ignore
         self.log_states(dof_targets)
         if self.vel_command is not None:
             self.update_vel_command()
+        elif hasattr(self.policy, 'tar_dir'):
+            self.update_steering_command()
 
-        dof_pos = self.mj_data.qpos.astype(np.float32)[7:]
-        dof_vel = self.mj_data.qvel.astype(np.float32)[6:]
-        kp = self.robot.joint_stiffness.numpy()
-        kd = self.robot.joint_damping.numpy()
-        # ctrl_limit = [
-        #     np.minimum(self.mj_model.actuator_forcerange[:, 0],
-        #                self.mj_model.actuator_ctrlrange[:, 0]),
-        #     np.maximum(self.mj_model.actuator_forcerange[:, 1],
-        #                self.mj_model.actuator_ctrlrange[:, 1]),
-        # ]
-        ctrl_limit = self.robot.effort_limit.numpy()
-        for i in range(self.decimation):
-            self.mj_data.ctrl = np.clip(
-                kp * (dof_targets - dof_pos) - kd * dof_vel,
-                -ctrl_limit,
-                ctrl_limit,
-            )
-            mujoco.mj_step(self.mj_model, self.mj_data)
+        if self._use_native_pd:
+            # Native position actuator: ctrl = target position.
+            # MuJoCo computes force = kp*(ctrl-pos) - kd*vel internally
+            # at each physics sub-step (closer to PhysX implicit PD).
+            self.mj_data.ctrl[:] = dof_targets
+            for i in range(self.decimation):
+                mujoco.mj_step(self.mj_model, self.mj_data)
+        else:
+            # Manual PD computation (legacy path)
             dof_pos = self.mj_data.qpos.astype(np.float32)[7:]
             dof_vel = self.mj_data.qvel.astype(np.float32)[6:]
+            kp = self.robot.joint_stiffness.numpy()
+            kd = self.robot.joint_damping.numpy()
+            ctrl_limit = self.robot.effort_limit.numpy()
+            for i in range(self.decimation):
+                self.mj_data.ctrl = np.clip(
+                    kp * (dof_targets - dof_pos) - kd * dof_vel,
+                    -ctrl_limit,
+                    ctrl_limit,
+                )
+                mujoco.mj_step(self.mj_model, self.mj_data)
+                dof_pos = self.mj_data.qpos.astype(np.float32)[7:]
+                dof_vel = self.mj_data.qvel.astype(np.float32)[6:]
 
     def run(self):
-        with mujoco.viewer.launch_passive(
-                self.mj_model, self.mj_data) as viewer:
+        try:
+            with mujoco.viewer.launch_passive(
+                    self.mj_model, self.mj_data) as viewer:
 
-            self.viewer = viewer
-            viewer.cam.elevation = -20
-            if self.vel_command is not None:
-                print("\nSet command (x, y, yaw): ", end="")
-            self.update_state()
-            self.start()
-            while viewer.is_running() and self.is_running:
-                sleep(self.cfg.mujoco.physics_dt * self.cfg.mujoco.decimation)
+                self.viewer = viewer
+                viewer.cam.elevation = -20
+                if self.vel_command is not None:
+                    print("\nSet command (x, y, yaw): ", end="")
+                elif hasattr(self.policy, 'tar_dir'):
+                    print("\nSet command (tar_dir_x, tar_dir_y, speed [omega]): ", end="")
                 self.update_state()
-                dof_targets = self.policy_step()
-                self.ctrl_step(dof_targets)
+                self.start()
+                while viewer.is_running() and self.is_running:
+                    sleep(self.cfg.mujoco.physics_dt * self.cfg.mujoco.decimation)
+                    self.update_state()
+                    dof_targets = self.policy_step()
+                    self.ctrl_step(dof_targets)
 
-                if self.cfg.mujoco.visualize_reference_ghost:
-                    # Render kinematic "ghost" robot from generalized coordinates.
-                    self.render_reference_robot(
-                        viewer,
-                        rgba=self._ghost_rgba,
-                    )
+                    if self.cfg.mujoco.visualize_reference_ghost:
+                        # Render kinematic "ghost" robot from generalized coordinates.
+                        self.render_reference_robot(
+                            viewer,
+                            rgba=self._ghost_rgba,
+                        )
 
-                self.viewer.cam.lookat[:] = self.mj_data.qpos.astype(np.float32)[0:3]
-                self.viewer.sync()
+                    self.viewer.cam.lookat[:] = self.mj_data.qpos.astype(np.float32)[0:3]
+                    self.viewer.sync()
+        finally:
+            self._flush_logged_states()
+            if hasattr(self.policy, 'flush_policy_log_if_enabled'):
+                self.policy.flush_policy_log_if_enabled()

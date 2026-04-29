@@ -71,11 +71,16 @@ def main():
             [args.tar_dir_x, args.tar_dir_y], dtype=torch.float32
         )
         ctrl.policy.tar_speed = torch.tensor([args.tar_speed], dtype=torch.float32)
-        ctrl.policy.tar_omega = torch.tensor([args.tar_omega], dtype=torch.float32)
+        # tar_omega only applies to policies that take a yaw-rate command
+        # (steering). Dribbling policies expose tar_dir + tar_speed only.
+        if hasattr(ctrl.policy, "tar_omega"):
+            ctrl.policy.tar_omega = torch.tensor(
+                [args.tar_omega], dtype=torch.float32
+            )
     else:
         raise RuntimeError(
             f"Task '{args.task}' does not expose tar_dir; this recorder is "
-            "specialized for steering policies."
+            "specialized for steering / dribbling policies."
         )
 
     # One control tick per video frame keeps things simple and matches

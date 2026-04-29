@@ -95,25 +95,45 @@ class MujocoController(BaseController):
 
         self._use_native_pd = False
 
+        # # Apply Python-config kp/kd to position actuator parameters so that
+        # # KP_SCALE (and any KP_OVERRIDE) in task configs takes effect with
+        # # native PD. The XML's kp/kv values are overridden here at load time.
+        # # For a <position> actuator: force = kp*(ctrl-q) - kv*qd, encoded as:
+        # #   gainprm[0] = kp, biasprm[1] = -kp, biasprm[2] = -kv.
+        # if self._use_native_pd:
+        #     kp_arr = self.robot.joint_stiffness.numpy()
+        #     kd_arr = self.robot.joint_damping.numpy()
+        #     n_act = min(len(self.robot.cfg.joint_names), int(self.mj_model.nu))
+        #     for i in range(n_act):
+        #         self.mj_model.actuator_gainprm[i, 0] = float(kp_arr[i])
+        #         self.mj_model.actuator_biasprm[i, 1] = -float(kp_arr[i])
+        #         self.mj_model.actuator_biasprm[i, 2] = -float(kd_arr[i])
+
         # Fix ground contact: ensure friction is enabled (condim>=3)
         # and set friction to reasonable value for walking.
         ground_id = mujoco.mj_name2id(
             self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, "ground"
         )
         if ground_id >= 0:
-            self.mj_model.geom_condim[ground_id] = 3
-            self.mj_model.geom_friction[ground_id] = [1.0, 0.005, 0.0001]
+            self.mj_model.geom_condim[ground_id] = 6
+            self.mj_model.geom_friction[ground_id] = self.cfg.mujoco.ground_friction
 
         self.mj_data = mujoco.MjData(self.mj_model)
         mujoco.mj_resetData(self.mj_model, self.mj_data)
 
-        self.mj_data.qpos = np.concatenate(
+        # Initialize only the robot's qpos slice (root + 22 DoF). Composite
+        # scenes that add extra free-jointed bodies (e.g. a ball) leave those
+        # qpos entries at the mj_resetData defaults; their initial state is
+        # the responsibility of whichever task owns them, typically set in
+        # the policy's reset() hook.
+        robot_qpos_init = np.concatenate(
             [
                 np.array(self.cfg.mujoco.init_pos, dtype=np.float32),
                 np.array(self.cfg.mujoco.init_quat, dtype=np.float32),
                 self.robot.default_joint_pos.numpy(),
             ]
         )
+        self.mj_data.qpos[: len(robot_qpos_init)] = robot_qpos_init
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
         # render a second "ghost" robot (kinematic only) without
@@ -166,6 +186,47 @@ class MujocoController(BaseController):
 
         for i in range(viewer.user_scn.ngeom):
             viewer.user_scn.geoms[i].rgba[:] = rgba
+
+    def _render_command_arrow(self, viewer) -> None:
+        """Draw a 3-D arrow showing the current command velocity in the viewer."""
+        policy = self.policy
+        # Collect (dir_x, dir_y, speed) from whichever command interface is active.
+        if hasattr(policy, 'tar_dir') and hasattr(policy, 'tar_speed'):
+            dir_x = float(policy.tar_dir[0])
+            dir_y = float(policy.tar_dir[1])
+            speed = float(policy.tar_speed) if not hasattr(policy.tar_speed, '__len__') else float(policy.tar_speed[0])
+        elif self.vel_command is not None:
+            cmd = self.vel_command
+            speed = float(np.hypot(cmd.lin_vel_x, cmd.lin_vel_y))
+            if speed > 1e-6:
+                dir_x, dir_y = cmd.lin_vel_x / speed, cmd.lin_vel_y / speed
+            else:
+                dir_x, dir_y = 1.0, 0.0
+        else:
+            return
+
+        if viewer.user_scn.ngeom >= viewer.user_scn.maxgeom:
+            return
+
+        root_pos = self.mj_data.qpos[:3].copy()
+        arrow_z = root_pos[2]          # draw at root height
+        arrow_from = np.array([root_pos[0], root_pos[1], arrow_z])
+        arrow_to   = np.array([root_pos[0] + dir_x * speed,
+                                root_pos[1] + dir_y * speed,
+                                arrow_z])
+
+        geom = viewer.user_scn.geoms[viewer.user_scn.ngeom]
+        mujoco.mjv_initGeom(
+            geom,
+            mujoco.mjtGeom.mjGEOM_ARROW,
+            np.zeros(3),
+            np.zeros(3),
+            np.zeros(9),
+            np.array([0.1, 0.8, 0.1, 0.9], dtype=np.float32),  # green
+        )
+        mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_ARROW, 0.025,
+                             arrow_from, arrow_to)
+        viewer.user_scn.ngeom += 1
 
     def set_reference_qpos(
         self,
@@ -244,10 +305,20 @@ class MujocoController(BaseController):
                 )
 
     def update_steering_command(self):
-        """Read steering commands from joystick or stdin: tar_dir_x tar_dir_y speed [omega]"""
-        import torch
+        """Read steering commands (vx vy vyaw) from joystick or stdin."""
+        import torch, math
 
-        # Use joystick if available
+        def _vel_to_policy(vx, vy, vyaw):
+            speed = math.sqrt(vx**2 + vy**2)
+            if speed > 1e-6:
+                dir_x, dir_y = vx / speed, vy / speed
+            else:
+                dir_x, dir_y = 1.0, 0.0
+            self.policy.tar_dir = torch.tensor([dir_x, dir_y], dtype=torch.float32)
+            self.policy.tar_speed = torch.tensor([speed], dtype=torch.float32)
+            if hasattr(self.policy, 'tar_omega'):
+                self.policy.tar_omega = torch.tensor([vyaw], dtype=torch.float32)
+
         if self.joystick_enabled and self.joystick_handler:
             joystick_cfg = self.cfg.steering_joystick_command
             vx, vy, vyaw = self.joystick_handler.get_velocities(
@@ -255,55 +326,39 @@ class MujocoController(BaseController):
                 joystick_cfg.vy_max,
                 joystick_cfg.vyaw_max,
             )
-
-            # Convert to steering commands
-            # Left stick gives direction and speed
-            speed = (vx**2 + vy**2)**0.5
-            if speed > 0:
-                # Normalize direction
-                dir_x = vx / speed
-                dir_y = vy / speed
-            else:
-                dir_x, dir_y = 1.0, 0.0  # Default forward
-
-            speed = min(speed, joystick_cfg.vx_max)
-            omega = vyaw
-
-            self.policy.tar_dir = torch.tensor([dir_x, dir_y], dtype=torch.float32)
-            self.policy.tar_speed = torch.tensor([speed], dtype=torch.float32)
-            self.policy.tar_omega = torch.tensor([omega], dtype=torch.float32)
+            _vel_to_policy(vx, vy, vyaw)
             return
 
-        # Fallback to keyboard input
         if select.select([sys.stdin], [], [], 0)[0]:
             try:
                 parts = sys.stdin.readline().strip().split()
-                if len(parts) in (3, 4):
-                    tx, ty, spd = map(float, parts[:3])
-                    omega = float(parts[3]) if len(parts) == 4 else 0.0
-                    self.policy.tar_dir = torch.tensor([tx, ty], dtype=torch.float32)
-                    self.policy.tar_speed = torch.tensor([spd], dtype=torch.float32)
-                    self.policy.tar_omega = torch.tensor([omega], dtype=torch.float32)
+                if len(parts) == 3:
+                    vx, vy, vyaw = map(float, parts)
+                    _vel_to_policy(vx, vy, vyaw)
+                    speed = math.sqrt(vx**2 + vy**2)
                     print(
-                        f"Updated: tar_dir=[{tx}, {ty}], speed={spd}, "
-                        f"omega={omega}\n"
-                        "Set command (tar_dir_x, tar_dir_y, speed [omega]): ",
+                        f"Updated: vx={vx}, vy={vy}, vyaw={vyaw} "
+                        f"(speed={speed:.2f})\n"
+                        "Set command (vx vy vyaw): ",
                         end="",
                     )
                 else:
                     raise ValueError
             except (ValueError, AttributeError):
                 print(
-                    "Invalid input. Enter 3 values (tar_dir_x, tar_dir_y, speed) "
-                    "or 4 values (+ omega).\n"
-                    "Set command (tar_dir_x, tar_dir_y, speed [omega]): ",
+                    "Invalid input. Enter 3 values: vx vy vyaw\n"
+                    "Set command (vx vy vyaw): ",
                     end="",
                 )
 
     def update_state(self) -> None:
-        dof_pos = self.mj_data.qpos.astype(np.float32)[7:]
-        dof_vel = self.mj_data.qvel.astype(np.float32)[6:]
-        dof_torque = self.mj_data.qfrc_actuator[6:].astype(np.float32)
+        # Slice only the robot's actuated dofs (composite scenes may have
+        # extra free-jointed bodies past this slice; they're not part of the
+        # robot state).
+        n_dof = len(self.robot.cfg.joint_names)
+        dof_pos = self.mj_data.qpos.astype(np.float32)[7 : 7 + n_dof]
+        dof_vel = self.mj_data.qvel.astype(np.float32)[6 : 6 + n_dof]
+        dof_torque = self.mj_data.qfrc_actuator[6 : 6 + n_dof].astype(np.float32)
 
         base_pos_w = self.mj_data.qpos.astype(np.float32)[:3]
         base_quat_wxyz = self.mj_data.qpos.astype(np.float32)[3:7]
@@ -415,26 +470,61 @@ class MujocoController(BaseController):
             for i in range(self.decimation):
                 mujoco.mj_step(self.mj_model, self.mj_data)
         else:
-            # Manual PD computation (legacy path)
-            dof_pos = self.mj_data.qpos.astype(np.float32)[7:]
-            dof_vel = self.mj_data.qvel.astype(np.float32)[6:]
+            # Manual PD computation (legacy path).
+            # Slice only the robot's actuated dofs: root free joint takes the
+            # first 7 qpos / 6 qvel slots, then 22 named joints. Composite
+            # scenes (e.g. ball after the robot) live past this slice and
+            # must not be touched here.
+            n_dof = len(self.robot.cfg.joint_names)
+            dof_pos = self.mj_data.qpos.astype(np.float32)[7 : 7 + n_dof]
+            dof_vel = self.mj_data.qvel.astype(np.float32)[6 : 6 + n_dof]
             kp = self.robot.joint_stiffness.numpy()
             kd = self.robot.joint_damping.numpy()
             ctrl_limit = self.robot.effort_limit.numpy()
             for i in range(self.decimation):
-                self.mj_data.ctrl = np.clip(
+                self.mj_data.ctrl[:n_dof] = np.clip(
                     kp * (dof_targets - dof_pos) - kd * dof_vel,
                     -ctrl_limit,
                     ctrl_limit,
                 )
                 mujoco.mj_step(self.mj_model, self.mj_data)
-                dof_pos = self.mj_data.qpos.astype(np.float32)[7:]
-                dof_vel = self.mj_data.qvel.astype(np.float32)[6:]
+                dof_pos = self.mj_data.qpos.astype(np.float32)[7 : 7 + n_dof]
+                dof_vel = self.mj_data.qvel.astype(np.float32)[6 : 6 + n_dof]
+
+    def _make_key_callback(self):
+        """Return a GLFW key callback that sets a flag on Backspace.
+
+        The viewer calls mj_resetData *after* the callback returns, so we
+        cannot re-spawn objects inside the callback itself. Instead we set a
+        flag and handle it in the main loop on the next iteration, after the
+        viewer's reset has already been applied to mj_data.
+        """
+        GLFW_KEY_BACKSPACE = 259
+        self._pending_reset = False
+
+        def key_callback(keycode):
+            if keycode == GLFW_KEY_BACKSPACE:
+                self._pending_reset = True
+
+        return key_callback
+
+    def _apply_pending_reset(self) -> None:
+        """Re-initialize robot qpos and call policy.reset() after a viewer reset."""
+        robot_qpos_init = np.concatenate([
+            np.array(self.cfg.mujoco.init_pos, dtype=np.float32),
+            np.array(self.cfg.mujoco.init_quat, dtype=np.float32),
+            self.robot.default_joint_pos.numpy(),
+        ])
+        self.mj_data.qpos[:len(robot_qpos_init)] = robot_qpos_init
+        self.mj_data.qvel[:] = 0.0
+        self.policy.reset()
+        mujoco.mj_forward(self.mj_model, self.mj_data)
 
     def run(self):
         try:
             with mujoco.viewer.launch_passive(
-                    self.mj_model, self.mj_data) as viewer:
+                    self.mj_model, self.mj_data,
+                    key_callback=self._make_key_callback()) as viewer:
 
                 self.viewer = viewer
                 viewer.cam.elevation = -20
@@ -442,7 +532,7 @@ class MujocoController(BaseController):
                     if self.vel_command is not None:
                         print("\nSet command (x, y, yaw): ", end="")
                     elif hasattr(self.policy, 'tar_dir'):
-                        print("\nSet command (tar_dir_x, tar_dir_y, speed [omega]): ", end="")
+                        print("\nSet command (vx vy vyaw): ", end="")
                 else:
                     print("\nJoystick Control Active:")
                     print("  Left Stick: ↑↓ Forward/Back | ←→ Left/Right")
@@ -465,8 +555,14 @@ class MujocoController(BaseController):
                     self._joystick_display_initialized = True
                 self.update_state()
                 self.start()
+                _prev_time = self.mj_data.time
                 while viewer.is_running() and self.is_running:
                     sleep(self.cfg.mujoco.physics_dt * self.cfg.mujoco.decimation)
+                    _cur_time = self.mj_data.time
+                    if _cur_time < _prev_time or (self._pending_reset and _cur_time < 1e-9):
+                        self._pending_reset = False
+                        self._apply_pending_reset()
+                    _prev_time = _cur_time
                     self.update_state()
                     dof_targets = self.policy_step()
                     self.ctrl_step(dof_targets)
@@ -504,12 +600,15 @@ class MujocoController(BaseController):
                                 joystick_cfg.vyaw_max,
                             ))
 
+                    viewer.user_scn.ngeom = 0
                     if self.cfg.mujoco.visualize_reference_ghost:
                         # Render kinematic "ghost" robot from generalized coordinates.
                         self.render_reference_robot(
                             viewer,
                             rgba=self._ghost_rgba,
                         )
+
+                    self._render_command_arrow(viewer)
 
                     self.viewer.cam.lookat[:] = self.mj_data.qpos.astype(np.float32)[0:3]
                     self.viewer.sync()

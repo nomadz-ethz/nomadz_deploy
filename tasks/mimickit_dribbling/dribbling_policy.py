@@ -179,6 +179,15 @@ class DribblingPolicy(JitPolicy):
         self._ball_qpos_adr = int(mj_model.jnt_qposadr[ball_jnt_id])
         self._ball_qvel_adr = int(mj_model.jnt_dofadr[ball_jnt_id])
 
+        # # Override all policy joint limits to ±90 degrees to match the USD file.
+        # _half_pi = math.pi / 2.0
+        # for _name in POLICY_JOINT_NAMES:
+        #     _jnt_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_JOINT, _name)
+        #     if _jnt_id >= 0:
+        #         mj_model.jnt_range[_jnt_id, 0] = -_half_pi
+        #         mj_model.jnt_range[_jnt_id, 1] = _half_pi
+        #         mj_model.jnt_limited[_jnt_id] = 1
+
         # FOV bounds in tan-of-half-angle form.
         self._fov_max_u = math.tan(math.radians(cfg.camera_fov_horizontal_deg / 2.0))
         self._fov_max_v = math.tan(math.radians(cfg.camera_fov_vertical_deg / 2.0))

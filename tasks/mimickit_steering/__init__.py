@@ -22,9 +22,9 @@ _policy_log_path = f"{_log_path_stem}_policy" if _log_path_stem else None
 
 
 CONTROL_FREQUENCY_HZ = 30.0
-SIMULATION_FREQUENCY_HZ = 120.0
+SIMULATION_FREQUENCY_HZ = 480.0
 CONTROL_DECIMATION = int(SIMULATION_FREQUENCY_HZ / CONTROL_FREQUENCY_HZ)
-CHECKPOINT_PATH = "models/A027_model.pt"
+CHECKPOINT_PATH = "models/A030_model.pt"
 
 # Trunk height that places K1's zero-pose feet just above the MJCF floor.
 MUJOCO_ZERO_POSE_ROOT_HEIGHT_M = 0.557
@@ -54,7 +54,16 @@ class K1MimicKitSteeringCfg(ControllerCfg):
     robot = K1_CFG.replace(  # type: ignore
         joint_stiffness=_kp,
         joint_damping=list(K1_CFG.joint_damping),
-        default_joint_pos=[0.0] * 22,
+        # default_joint_pos=[0.0] * 22,
+        default_joint_pos=[
+            0.0, 0.0,          # Head yaw, pitch
+            0.0, -1.57,         # L Shoulder pitch, roll
+            0.0, 0.0,          # L Elbow pitch, yaw
+            0.0, 1.57,        # R Shoulder pitch, roll
+            0.0, 0.0,          # R Elbow pitch, yaw
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # L leg
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # R leg
+        ]
     )
 
     # Steering commands are provided directly as tar_dir(2) + speed(1)

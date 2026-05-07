@@ -31,9 +31,9 @@ _policy_log_path = f"{_log_path_stem}_policy" if _log_path_stem else None
 
 
 CONTROL_FREQUENCY_HZ = 30.0
-SIMULATION_FREQUENCY_HZ = 120.0
+SIMULATION_FREQUENCY_HZ = 120.0  # 4x substeps: reduces bang-bang contact impulse at kp=4584 N·m/rad
 CONTROL_DECIMATION = int(SIMULATION_FREQUENCY_HZ / CONTROL_FREQUENCY_HZ)
-CHECKPOINT_PATH = "models/B011_2_model.pt"
+CHECKPOINT_PATH = "models/B024_model.pt"
 
 # Trunk height that places K1's zero-pose feet just above the MJCF floor.
 MUJOCO_ZERO_POSE_ROOT_HEIGHT_M = 0.557
@@ -44,11 +44,10 @@ KD_OVERRIDE: list[float] | None = None
 # KP_OVERRIDE = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 40, 40, 40, 40, 15, 15, 40, 40, 40, 40, 15, 15]
 
 # Uniform scale applied on top of KP_OVERRIDE (or the defaults). 1.0 = no change.
-KP_SCALE: float = 2.5
+KP_SCALE: float = 1.0
 KD_SCALE: float = 1.0
 _base_kp = KP_OVERRIDE if KP_OVERRIDE is not None else list(K1_CFG.joint_stiffness)
 _kp = [v * KP_SCALE for v in _base_kp]
-
 
 _base_kd = KD_OVERRIDE if KD_OVERRIDE is not None else list(K1_CFG.joint_damping)
 _kd = [v * KD_SCALE for v in _base_kd]
@@ -62,22 +61,35 @@ _kd = [v * KD_SCALE for v in _base_kd]
 # The file name is prefixed with `_` to mark it as a generated artifact.
 # ---------------------------------------------------------------------------
 _K1_DIR = os.path.join(BOOSTER_ASSETS_DIR, "robots", "K1")
-_K1_MJCF = os.path.join(_K1_DIR, "K1_22dof.xml")
+_K1_MJCF = os.path.join(_K1_DIR, "K1_22dof_orig.xml")
 _SCENE_MJCF = os.path.join(_K1_DIR, "_k1_dribbling_scene.xml")
 
 # Ball physics roughly match the dribbling training env (mass 0.45 kg,
 # radius 0.08 m, friction in the trained range, restitution 0.6).
 BALL_RADIUS_M = 0.08
 BALL_MASS_KG = 0.45
-BALL_FRICTION = 0.3
+BALL_FRICTION = 0.4
 BALL_RGBA = "1.0 0.6 0.0 1.0"
+
+# Throw-cube projectile. The body is always present in the scene; the
+# controller only launches it when enable_throw=True. Between throws it
+# rests far off-screen at THROW_PARK_POS so it can't interact with the
+# robot or ball.
+#
+# Tunable knobs ↓
+THROW_CUBE_SIDE_M = 0.25           # full side length of the cube, in meters
+THROW_CUBE_MASS_KG = 5.0           # mass of the cube, in kilograms
+# (Visual / scene plumbing — usually leave alone)
+THROW_CUBE_RGBA = "0.1 0.2 0.9 1.0"
+THROW_PARK_POS = "10 10 0.02"      # m; well outside the dribbling area
+_THROW_CUBE_HALFSIZE_M = THROW_CUBE_SIDE_M / 2  # MuJoCo box `size` is half-extent
 
 # solref="timeconst dampratio": both values must be positive to avoid MuJoCo
 # "mixed solref format" warning. dampratio < 1 = underdamped = bouncy contact.
 # Lower dampratio → more bounce (0 = fully elastic, 1 = critically damped).
 _SCENE_XML = f"""<mujoco model="k1_dribbling">
-  <include file="K1_22dof.xml"/>
-
+  <include file="K1_22dof_orig.xml"/>
+`
   <worldbody>
     <body name="ball" pos="0 0 {BALL_RADIUS_M}">
       <freejoint name="ball_joint"/>
@@ -86,6 +98,15 @@ _SCENE_XML = f"""<mujoco model="k1_dribbling">
             friction="{BALL_FRICTION} 0.005 0.02" condim="6"
             solimp="0.95 0.99 0.001" solref="0.008 0.2"
             rgba="{BALL_RGBA}"/>
+    </body>
+
+    <body name="throw_cube" pos="{THROW_PARK_POS}">
+      <freejoint name="throw_cube_joint"/>
+      <geom name="throw_cube_geom" type="box"
+            size="{_THROW_CUBE_HALFSIZE_M} {_THROW_CUBE_HALFSIZE_M} {_THROW_CUBE_HALFSIZE_M}"
+            mass="{THROW_CUBE_MASS_KG}"
+            friction="0.5 0.005 0.0001" condim="3"
+            rgba="{THROW_CUBE_RGBA}"/>
     </body>
   </worldbody>
 </mujoco>
@@ -112,8 +133,17 @@ class K1MimicKitDribblingCfg(ControllerCfg):
         joint_stiffness=_kp,
         #joint_stiffness=list(K1_CFG.joint_stiffness),
         joint_damping=_kd,
-        default_joint_pos=[0.0] * 22,
-    )
+        # default_joint_pos=[0.0] * 22,
+        default_joint_pos=[
+            0.0, 0.0,          # Head yaw, pitch
+            0.0, -1.57,         # L Shoulder pitch, roll
+            0.0, 0.0,          # L Elbow pitch, yaw
+            0.0, 1.57,        # R Shoulder pitch, roll
+            0.0, 0.0,          # R Elbow pitch, yaw
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # L leg
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # R leg
+        ]
+            )
 
     # Steering commands (tar_dir + tar_speed) come via stdin / property
     # setters, not via the standard velocity command path.
@@ -128,12 +158,36 @@ class K1MimicKitDribblingCfg(ControllerCfg):
         checkpoint_path=CHECKPOINT_PATH,
         enable_safety_fallback=False,
         log_path=_policy_log_path,
+        action_smoothing=1.0,
     )
 
     mujoco = MujocoControllerCfg(
         init_pos=[0.0, 0.0, MUJOCO_ZERO_POSE_ROOT_HEIGHT_M],
         decimation=CONTROL_DECIMATION,
         log_states=_mujoco_log_path,
+        ground_friction=[1.0, 0.005, 0.0001],
+        enable_push= False,
+        push_force_min=50.0,
+        push_force_max=75.0,
+        push_interval_min=5.0,
+        push_interval_max=5.0,
+        push_duration=0.1,
+        push_body="Trunk",
+        enable_fall_reset=True,
+        fall_height_threshold=0.3,
+        fall_grace_period=0.5,
+        enable_throw=False,
+        throw_object_body="throw_cube",
+        throw_object_joint="throw_cube_joint",
+        throw_speed_min=5.0,
+        throw_speed_max=8.0,
+        throw_distance=2.0,
+        throw_height_min=0.5,
+        throw_height_max=1.2,
+        throw_aim_offset=0.1,
+        throw_spin_max=5.0,
+        throw_interval_min=5.0,
+        throw_interval_max=5.0,
     )
 
 

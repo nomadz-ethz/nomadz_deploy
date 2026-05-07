@@ -93,21 +93,63 @@ class MujocoController(BaseController):
         self.mj_model.opt.timestep = self.cfg.mujoco.physics_dt
         self.decimation = self.cfg.mujoco.decimation
 
-        self._use_native_pd = False
+        self._use_native_pd = bool(self.cfg.mujoco.use_native_pd)
+        # kp_arr = self.robot.joint_stiffness.numpy() #* _DEG_TO_RAD
+        # kd_arr = self.robot.joint_damping.numpy() #* _DEG_TO_RAD
+        # n_act = min(len(self.robot.cfg.joint_names), int(self.mj_model.nu))
+        # self.mj_model.dof_armature[6 : 6 + n_act] = 0.02
+        # self.mj_model.dof_armature[6 + 12] = 0.0   # Left_Hip_Yaw
+        # self.mj_model.dof_armature[6 + 18] = 0.0   # Right_Hip_Yaw
 
-        # # Apply Python-config kp/kd to position actuator parameters so that
-        # # KP_SCALE (and any KP_OVERRIDE) in task configs takes effect with
-        # # native PD. The XML's kp/kv values are overridden here at load time.
-        # # For a <position> actuator: force = kp*(ctrl-q) - kv*qd, encoded as:
-        # #   gainprm[0] = kp, biasprm[1] = -kp, biasprm[2] = -kv.
-        # if self._use_native_pd:
-        #     kp_arr = self.robot.joint_stiffness.numpy()
-        #     kd_arr = self.robot.joint_damping.numpy()
-        #     n_act = min(len(self.robot.cfg.joint_names), int(self.mj_model.nu))
-        #     for i in range(n_act):
-        #         self.mj_model.actuator_gainprm[i, 0] = float(kp_arr[i])
-        #         self.mj_model.actuator_biasprm[i, 1] = -float(kp_arr[i])
-        #         self.mj_model.actuator_biasprm[i, 2] = -float(kd_arr[i])
+        # Implicit PD: rewrite each <motor> actuator into a <position>-style
+        # general actuator with the robot config's kp/kd, and switch the
+        # integrator to MuJoCo's full implicit so both the kp*(ctrl-q) and
+        # -kd*qd terms are folded into the effective mass matrix each step
+        # (matches PhysX/Isaac Lab's implicit-PD math). implicitfast would
+        # only treat the damping term implicitly while leaving the stiffness
+        # term explicit — fine at low gains, but the training-time gains
+        # (kp ≈ 80 on legs) prefer the full implicit integrator.
+        #
+        # A <position> actuator is a <general> with:
+        #   gaintype = fixed   → force_gain = ctrl * gainprm[0]
+        #   biastype = affine  → force_bias = biasprm[0] + biasprm[1]*q + biasprm[2]*qd
+        # so force = kp*(ctrl - q) - kv*qd is encoded as
+        #   gainprm = [kp, 0, 0], biasprm = [0, -kp, -kv].
+        # K1's <motor> tags only set forcerange (output torque saturation);
+        # ctrlrange is unset, so leaving forcerange/forcelimited alone keeps
+        # the original torque limits in effect once ctrl is reinterpreted as
+        # a joint target.
+        # The MJCF <joint damping> values (2 N·m·s/rad legs, 1 arms/head) match
+        # training's kd exactly. They are treated implicitly by MuJoCo's
+        # implicitfast integrator (folded into the mass matrix each step),
+        # mirroring PhysX's implicit drive. The manual PD torque below therefore
+        # uses only the kp term; adding -kd*vel there would double-count damping
+        # and make it explicit instead of implicit.
+        if self._use_native_pd:
+            _RAD_TO_DEG = 180.0 / np.pi
+            kp_arr = self.robot.joint_stiffness.numpy() #* _RAD_TO_DEG
+            kd_arr = self.robot.joint_damping.numpy() #* _RAD_TO_DEG
+            self.mj_model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+            n_act = min(len(self.robot.cfg.joint_names), int(self.mj_model.nu))
+            # self.mj_model.dof_armature[6 : 6 + n_act] = 0.02
+            # self.mj_model.dof_armature[6 + 12] = 0.0   # Left_Hip_Yaw
+            # self.mj_model.dof_armature[6 + 18] = 0.0   # Right_Hip_Yaw
+            # dof_frictionloss is intentionally left at 0 even though training
+            # uses physxJoint:jointFriction=0.02. PhysX applies smooth viscous
+            # friction near zero velocity; MuJoCo dof_frictionloss is a hard
+            # Coulomb constraint that causes stick-slip chattering at 30 Hz.
+            # self.mj_model.dof_frictionloss[6 : 6 + n_act] = 0.02
+
+            for i in range(n_act):
+                self.mj_model.actuator_gaintype[i] = mujoco.mjtGain.mjGAIN_FIXED
+                self.mj_model.actuator_biastype[i] = mujoco.mjtBias.mjBIAS_AFFINE
+                self.mj_model.actuator_gainprm[i, 0] = float(kp_arr[i])
+                self.mj_model.actuator_gainprm[i, 1] = 0.0
+                self.mj_model.actuator_gainprm[i, 2] = 0.0
+                self.mj_model.actuator_biasprm[i, 0] = 0.0
+                self.mj_model.actuator_biasprm[i, 1] = -float(kp_arr[i])
+                self.mj_model.actuator_biasprm[i, 2] = -float(kd_arr[i])
+                self.mj_model.actuator_ctrllimited[i] = 0
 
         # Fix ground contact: ensure friction is enabled (condim>=3)
         # and set friction to reasonable value for walking.
@@ -152,6 +194,52 @@ class MujocoController(BaseController):
 
         # Reference qpos can be set explicitly by the policy.
         self._reference_qpos: np.ndarray | None = None
+
+        # Random push state. Mirrors MimicKit's training-time push randomization:
+        # at each scheduled trigger time, sample a horizontal force in
+        # [push_force_min, push_force_max] N at a uniformly-random heading and
+        # apply it to push_body via xfrc_applied for push_duration seconds.
+        self._push_enabled = bool(self.cfg.mujoco.enable_push)
+        if self._push_enabled:
+            self._push_body_id = mujoco.mj_name2id(
+                self.mj_model, mujoco.mjtObj.mjOBJ_BODY, self.cfg.mujoco.push_body
+            )
+            if self._push_body_id < 0:
+                raise ValueError(
+                    f"push_body '{self.cfg.mujoco.push_body}' not found in MuJoCo model"
+                )
+            self._next_push_time: float = float(np.random.uniform(
+                self.cfg.mujoco.push_interval_min,
+                self.cfg.mujoco.push_interval_max,
+            ))
+            self._push_active_until: float = -1.0
+
+        # Auto-reset when the robot falls.
+        self._fall_reset_enabled = bool(self.cfg.mujoco.enable_fall_reset)
+        self._fall_reset_grace_until: float = float(self.cfg.mujoco.fall_grace_period)
+
+        # Throw projectile state. Resolves the qpos/qvel slice for the
+        # configured free joint (7 qpos / 6 qvel entries) so we can
+        # teleport-and-launch without touching other bodies in the scene.
+        self._throw_enabled = bool(self.cfg.mujoco.enable_throw)
+        if self._throw_enabled:
+            cfg = self.cfg.mujoco
+            self._throw_body_id = mujoco.mj_name2id(
+                self.mj_model, mujoco.mjtObj.mjOBJ_BODY, cfg.throw_object_body
+            )
+            self._throw_joint_id = mujoco.mj_name2id(
+                self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, cfg.throw_object_joint
+            )
+            if self._throw_body_id < 0 or self._throw_joint_id < 0:
+                raise ValueError(
+                    f"throw object '{cfg.throw_object_body}' / joint "
+                    f"'{cfg.throw_object_joint}' not found in MuJoCo model"
+                )
+            self._throw_qposadr = int(self.mj_model.jnt_qposadr[self._throw_joint_id])
+            self._throw_dofadr = int(self.mj_model.jnt_dofadr[self._throw_joint_id])
+            self._next_throw_time: float = float(np.random.uniform(
+                cfg.throw_interval_min, cfg.throw_interval_max
+            ))
 
         # Logging buffers are initialized lazily in log_states().
         self._states: dict[str, list[np.ndarray]] | None = None
@@ -454,6 +542,117 @@ class MujocoController(BaseController):
             f'with {num_entries} control steps'
         )
 
+    def _maybe_apply_push(self) -> None:
+        """Set/clear xfrc_applied on push_body to drive scheduled random pushes."""
+        if not self._push_enabled:
+            return
+        t = float(self.mj_data.time)
+
+        # Clear an expired push so the trunk isn't being pushed forever.
+        if self._push_active_until > 0.0 and t >= self._push_active_until:
+            self.mj_data.xfrc_applied[self._push_body_id, 0:3] = 0.0
+            self._push_active_until = -1.0
+
+        # Trigger a new push if it's time.
+        if t >= self._next_push_time:
+            fmag = float(np.random.uniform(
+                self.cfg.mujoco.push_force_min, self.cfg.mujoco.push_force_max
+            ))
+            theta = float(np.random.uniform(-np.pi, np.pi))
+            cos_t, sin_t = float(np.cos(theta)), float(np.sin(theta))
+            self.mj_data.xfrc_applied[self._push_body_id, 0] = fmag * cos_t
+            self.mj_data.xfrc_applied[self._push_body_id, 1] = fmag * sin_t
+            self.mj_data.xfrc_applied[self._push_body_id, 2] = 0.0
+            self.mj_data.xfrc_applied[self._push_body_id, 3:6] = 0.0
+            self._push_active_until = t + self.cfg.mujoco.push_duration
+            self._next_push_time = t + float(np.random.uniform(
+                self.cfg.mujoco.push_interval_min,
+                self.cfg.mujoco.push_interval_max,
+            ))
+            print(
+                f"[push] t={t:6.2f}s  F={fmag:5.2f}N  "
+                f"dir=({cos_t:+.2f},{sin_t:+.2f})"
+            )
+
+    def _maybe_throw_projectile(self) -> None:
+        """Teleport+launch the throw object at the robot at scheduled times.
+
+        Spawns at horizontal distance throw_distance from the trunk along a
+        random heading, at a height in [throw_height_min, throw_height_max],
+        and gives it an initial velocity aimed at trunk_z + throw_aim_offset
+        with magnitude in [throw_speed_min, throw_speed_max]. Random spin
+        in [-throw_spin_max, +throw_spin_max] per axis. Between throws the
+        body sits where it last landed.
+        """
+        if not self._throw_enabled:
+            return
+        t = float(self.mj_data.time)
+        if t < self._next_throw_time:
+            return
+
+        cfg = self.cfg.mujoco
+        trunk = np.asarray(self.mj_data.qpos[0:3], dtype=np.float64)
+
+        theta = float(np.random.uniform(-np.pi, np.pi))
+        spawn_h = float(np.random.uniform(cfg.throw_height_min, cfg.throw_height_max))
+        spawn = np.array([
+            trunk[0] + cfg.throw_distance * np.cos(theta),
+            trunk[1] + cfg.throw_distance * np.sin(theta),
+            spawn_h,
+        ], dtype=np.float64)
+
+        target = np.array([trunk[0], trunk[1], trunk[2] + cfg.throw_aim_offset], dtype=np.float64)
+        direction = target - spawn
+        dist = float(np.linalg.norm(direction))
+        if dist < 1e-6:
+            direction = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            direction /= dist
+        speed = float(np.random.uniform(cfg.throw_speed_min, cfg.throw_speed_max))
+        lin_vel = direction * speed
+
+        ang_vel = np.random.uniform(-cfg.throw_spin_max, cfg.throw_spin_max, size=3)
+
+        # Free joint qpos layout: [x, y, z, qw, qx, qy, qz]; qvel: [vx, vy, vz, wx, wy, wz].
+        qa, da = self._throw_qposadr, self._throw_dofadr
+        self.mj_data.qpos[qa:qa + 3] = spawn
+        self.mj_data.qpos[qa + 3:qa + 7] = np.array([1.0, 0.0, 0.0, 0.0])  # identity quat (wxyz)
+        self.mj_data.qvel[da:da + 3] = lin_vel
+        self.mj_data.qvel[da + 3:da + 6] = ang_vel
+        # Clear any leftover external force on the projectile.
+        self.mj_data.xfrc_applied[self._throw_body_id, :] = 0.0
+
+        self._next_throw_time = t + float(np.random.uniform(
+            cfg.throw_interval_min, cfg.throw_interval_max
+        ))
+        print(
+            f"[throw] t={t:6.2f}s  spawn=({spawn[0]:+.2f},{spawn[1]:+.2f},{spawn[2]:.2f})m  "
+            f"v={speed:.2f}m/s  → trunk"
+        )
+
+    def _maybe_reset_on_fall(self) -> None:
+        """Reset the robot if the trunk has dropped below fall_height_threshold.
+
+        Suppressed for fall_grace_period seconds after each reset so the
+        physics-settle transient on the first tick can't immediately
+        retrigger the check.
+        """
+        if not self._fall_reset_enabled:
+            return
+        t = float(self.mj_data.time)
+        if t < self._fall_reset_grace_until:
+            return
+        root_z = float(self.mj_data.qpos[2])
+        if root_z < self.cfg.mujoco.fall_height_threshold:
+            print(
+                f"[fall-reset] t={t:6.2f}s  root_z={root_z:.3f}m "
+                f"< {self.cfg.mujoco.fall_height_threshold:.3f}m  → reset"
+            )
+            self._apply_pending_reset()
+            # Push state is anchored on mj_data.time (which is NOT reset by
+            # _apply_pending_reset), so it stays on its original schedule.
+            self._fall_reset_grace_until = t + self.cfg.mujoco.fall_grace_period
+
     def ctrl_step(self, dof_targets: torch.Tensor):
         dof_targets = dof_targets.cpu().numpy()  # type: ignore
         self.log_states(dof_targets)
@@ -462,7 +661,11 @@ class MujocoController(BaseController):
         elif hasattr(self.policy, 'tar_dir'):
             self.update_steering_command()
 
-        if self._use_native_pd:
+        self._maybe_apply_push()
+        self._maybe_throw_projectile()
+        self._maybe_reset_on_fall()
+
+        if self._use_native_pd: 
             # Native position actuator: ctrl = target position.
             # MuJoCo computes force = kp*(ctrl-pos) - kd*vel internally
             # at each physics sub-step (closer to PhysX implicit PD).
@@ -470,17 +673,17 @@ class MujocoController(BaseController):
             for i in range(self.decimation):
                 mujoco.mj_step(self.mj_model, self.mj_data)
         else:
-            # Manual PD computation (legacy path).
-            # Slice only the robot's actuated dofs: root free joint takes the
-            # first 7 qpos / 6 qvel slots, then 22 named joints. Composite
-            # scenes (e.g. ball after the robot) live past this slice and
-            # must not be touched here.
+            # Default explicit-PD path (matches the original repo).
+            # Actuators stay as raw <motor> torque actuators, the integrator
+            # is whatever the MJCF declares (typically mjINT_EULER), and the
+            # kp/kd torque is computed in Python each substep. MJCF passive
+            # <joint damping> remains active on top.
             n_dof = len(self.robot.cfg.joint_names)
-            dof_pos = self.mj_data.qpos.astype(np.float32)[7 : 7 + n_dof]
-            dof_vel = self.mj_data.qvel.astype(np.float32)[6 : 6 + n_dof]
             kp = self.robot.joint_stiffness.numpy()
             kd = self.robot.joint_damping.numpy()
             ctrl_limit = self.robot.effort_limit.numpy()
+            dof_pos = self.mj_data.qpos.astype(np.float32)[7 : 7 + n_dof]
+            dof_vel = self.mj_data.qvel.astype(np.float32)[6 : 6 + n_dof]
             for i in range(self.decimation):
                 self.mj_data.ctrl[:n_dof] = np.clip(
                     kp * (dof_targets - dof_pos) - kd * dof_vel,
@@ -517,7 +720,7 @@ class MujocoController(BaseController):
         ])
         self.mj_data.qpos[:len(robot_qpos_init)] = robot_qpos_init
         self.mj_data.qvel[:] = 0.0
-        self.policy.reset()
+        self.policy.reset()  # policy._spawn_ball() repositions the ball
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
     def run(self):

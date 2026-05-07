@@ -185,7 +185,7 @@ class JitPolicyCfg(PolicyCfg):
     # EMA smoothing factor for action targets (0 < alpha <= 1).
     # 1.0 = no smoothing. Lower values bridge sim-to-sim PD differences
     # (e.g. PhysX implicit PD vs MuJoCo explicit PD).
-    action_smoothing: float = 0.5
+    action_smoothing: float = 0.5 #was 0.5
     # If set, writes a per-step diagnostic trace to ``{log_path}.npz``,
     # overwritten every POLICY_LOG_SAVE_INTERVAL steps.
     log_path: str | None = None

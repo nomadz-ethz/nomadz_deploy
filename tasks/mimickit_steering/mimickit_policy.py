@@ -1,13 +1,16 @@
 """Steering-policy deploy wrapper for the K1 robot.
 
-Builds a 53-D observation matching the training environment's
-``compute_xyomega_obs`` and feeds it to a TorchScript actor exported with
+Builds the observation matching the training environment's steering obs
+and feeds it to a TorchScript actor exported with
 ``scripts/export_amp_policy.py``. The scripted module bakes
 observation/action normalization and action clipping; this class adds the
 deploy-side concerns: command state, sim-state -> obs assembly, joint
 reordering, EMA smoothing, and optional trace logging.
 
-Observation layout (53D):
+Two observation layouts are supported via ``MimicKitPolicyCfg.obs_command_layout``,
+matching MimicKit's two steering env variants:
+
+``"xyomega"`` (53D, ``task_k1_xyomega_env.compute_xyomega_obs``):
     gravity_body  (3)  - world gravity rotated into the body frame
     ang_vel_body  (3)  - body-frame angular velocity
     dof_pos       (22) - joint positions in policy joint order
@@ -16,10 +19,21 @@ Observation layout (53D):
                          scaled by target speed (vx, vy)
     tar_omega     (1)  - signed target yaw rate (rad/s)
 
+``"vxomega"`` (52D, ``task_k1_vxomega_env.compute_vxomega_obs``):
+    gravity_body  (3)  - world gravity rotated into the body frame
+    ang_vel_body  (3)  - body-frame angular velocity
+    dof_pos       (22) - joint positions in policy joint order
+    dof_vel       (22) - joint velocities in policy joint order
+    tar_vx        (1)  - body-frame forward target velocity (m/s)
+    tar_omega     (1)  - signed target yaw rate (rad/s)
+
 Command convention:
     ``tar_dir`` is a unit XY vector in the world frame; it is rotated into
     the robot's heading frame and multiplied by ``tar_speed`` to produce
-    ``local_tar_vel``. ``tar_omega`` is a signed scalar yaw rate.
+    ``local_tar_vel``. For ``"vxomega"`` only the body-frame forward
+    component (``local_tar_vel[0]``) is exposed to the policy; any lateral
+    command is silently dropped (the trainer can't strafe). ``tar_omega``
+    is a signed scalar yaw rate, used by both layouts.
 """
 from __future__ import annotations
 
@@ -39,6 +53,10 @@ DEFAULT_TARGET_OMEGA_RAD_S = 0.0
 DEFAULT_TARGET_DIRECTION_WORLD_XY = (1.0, 0.0)
 DIRECTION_EPS = 1e-6
 WORLD_GRAVITY_DIRECTION = (0.0, 0.0, -1.0)
+
+OBS_LAYOUT_XYOMEGA = "xyomega"  # 53D: [..., local_tar_vel(2), tar_omega(1)]
+OBS_LAYOUT_VXOMEGA = "vxomega"  # 52D: [..., tar_vx(1), tar_omega(1)]
+_VALID_OBS_LAYOUTS = (OBS_LAYOUT_XYOMEGA, OBS_LAYOUT_VXOMEGA)
 
 
 # DFS traversal of the K1 articulation tree, identical to the URDF /
@@ -121,6 +139,12 @@ class MimicKitPolicy(JitPolicy):
 
     def __init__(self, cfg: MimicKitPolicyCfg, controller):
         super().__init__(cfg, controller)
+        if cfg.obs_command_layout not in _VALID_OBS_LAYOUTS:
+            raise ValueError(
+                f"obs_command_layout must be one of {_VALID_OBS_LAYOUTS}, "
+                f"got {cfg.obs_command_layout!r}"
+            )
+        self._obs_command_layout = cfg.obs_command_layout
         self._target_direction_world_xy = torch.tensor(
             DEFAULT_TARGET_DIRECTION_WORLD_XY, dtype=torch.float32
         )
@@ -194,13 +218,26 @@ class MimicKitPolicy(JitPolicy):
         ).squeeze(0)[:2]
         local_tar_vel = local_tar_dir * self._target_speed_mps
 
+        if self._obs_command_layout == OBS_LAYOUT_VXOMEGA:
+            # 52D: body-frame forward velocity scalar + yaw rate.
+            # local_tar_vel[0] is the heading-frame x-component, equivalent
+            # to the trainer's ``tar_vx``. Any commanded lateral component
+            # is silently dropped; the vxomega policy can't strafe.
+            cmd_block = torch.cat(
+                [local_tar_vel[0:1], self._target_omega_rad_s], dim=0
+            )
+        else:
+            # 53D xyomega: full body-frame target velocity + yaw rate.
+            cmd_block = torch.cat(
+                [local_tar_vel, self._target_omega_rad_s], dim=0
+            )
+
         return torch.cat([
             gravity_body,             # 3
             ang_vel_body,             # 3
             dof_pos_policy,           # 22
             dof_vel_policy,           # 22
-            local_tar_vel,            # 2
-            self._target_omega_rad_s, # 1
+            cmd_block,                # 2 (vxomega) or 3 (xyomega)
         ], dim=0)
 
     def _record_extra_log(self, entry, *, obs):
@@ -211,14 +248,28 @@ class MimicKitPolicy(JitPolicy):
             "obs_ang_vel_body":         obs_np[3:6],
             "obs_dof_pos_policy_order": obs_np[6:28],
             "obs_dof_vel_policy_order": obs_np[28:50],
-            "obs_local_tar_vel":        obs_np[50:52],
-            "obs_tar_omega":            obs_np[52:53],
             "tar_dir_world_xy":         self._target_direction_world_xy.detach().cpu().numpy().astype(np.float32),
             "tar_speed_mps":            self._target_speed_mps.detach().cpu().numpy().astype(np.float32),
             "tar_omega_rad_s":          self._target_omega_rad_s.detach().cpu().numpy().astype(np.float32),
         })
+        if self._obs_command_layout == OBS_LAYOUT_VXOMEGA:
+            entry.update({
+                "obs_tar_vx":    obs_np[50:51],
+                "obs_tar_omega": obs_np[51:52],
+            })
+        else:
+            entry.update({
+                "obs_local_tar_vel": obs_np[50:52],
+                "obs_tar_omega":     obs_np[52:53],
+            })
 
 
 @configclass
 class MimicKitPolicyCfg(JitPolicyCfg):
     constructor = MimicKitPolicy
+    # Selects the trainer obs layout to assemble. Must match the exported
+    # checkpoint; mismatches surface as a tensor-size error inside the
+    # scripted normalizer.
+    #   "xyomega" - 53D (body-frame vx+vy+omega), e.g. A027/A029.
+    #   "vxomega" - 52D (body-frame vx+omega only), e.g. A030.
+    obs_command_layout: str = OBS_LAYOUT_XYOMEGA

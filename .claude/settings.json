@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/nomadz-control/MimicKit/mimickit/envs/**)",
+      "Bash(find /home/nomadz-control/MimicKit -type f -name \"*obs*\" -o -name \"*norm*\" | grep -i \"k1\\\\|steering\" | head -10)",
+      "Read(//home/nomadz-control/MimicKit/**)"
+    ]
+  }
+}

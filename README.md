@@ -63,6 +63,38 @@ Booster Deploy is a lightweight deployment framework that supports running contr
    python scripts/deploy.py --task k1_mimickit_steering --mujoco --joystick --vx-max 1.5 --vy-max 1.0 --vyaw-max 1.2
    ```
 
+### Headless video recording (steering)
+
+Record an mp4 of the K1 steering policy in MuJoCo over SSH (no display required). The pipeline is fully isolated from the live `k1_mimickit_steering` task — it uses its own task (`k1_mimickit_steering_video`), its own model directory, and a dedicated recorder script.
+
+- Convert a MimicKit steering checkpoint to TorchScript:
+   ```bash
+   cd /home/nomadz-control/nomadz_deploy
+   python scripts/export_amp_policy.py \
+       --ckpt /home/nomadz-control/MimicKit/output/K1_Steering_output/<RUN>/model.pt \
+       --out  tasks/mimickit_steering_video/models/<NAME>_model.pt
+   ```
+   Then update `CHECKPOINT_FILENAME` in [`tasks/mimickit_steering_video/__init__.py`](tasks/mimickit_steering_video/__init__.py) to `"<NAME>_model.pt"`.
+
+- Record a video with a time-varying command schedule:
+   ```bash
+   conda activate gmr
+   cd /home/nomadz-control/nomadz_deploy
+   python scripts/sim2sim_mj_video_steering.py --task k1_mimickit_steering_video \
+       --out logs/steer_yaw_fwd_right.mp4 \
+       --schedule "10:0,0,1.5;10:1,0,0;10:0,-1,0"
+   ```
+   This yaws on the spot → walks forward → walks right (10 s each, 30 s total).
+
+- Schedule format: `dur:vx,vy,omega[;dur:vx,vy,omega]…`
+   - `dur` — segment duration in seconds
+   - `vx,vy` — target velocity in the robot's **body frame** (m/s); updated every control step as the robot yaws, so `(1,0)` always means forward relative to wherever the robot is currently facing, `(0,-1)` = right, `(0,1)` = left
+   - `omega` — target yaw rate in rad/s (positive = counter-clockwise)
+
+- Camera follows the robot's XY position but holds a fixed world-frame height so vertical bobbing is clearly visible. Default lookat height is 0.5 m; override with `--camera-lookat-height <m>`.
+
+- For the dribbling counterpart, see [`scripts/sim2sim_mj_video.py`](scripts/sim2sim_mj_video.py) and the `k1_mimickit_dribbling` task — same pipeline shape, but the schedule has 3 fields (`dx,dy,sp`, no omega) and the scene includes a ball.
+
 ### Run Sim2Real (Real Robots)
 
 **IMPORTANT**: Make sure to install [Booster Firmware](https://booster.feishu.cn/wiki/E3q5wF5SnitXZgkY18Uc8odBnXb) >= v1.4 on the robot before proceeding.

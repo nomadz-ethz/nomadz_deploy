@@ -28,12 +28,47 @@ from typing import TYPE_CHECKING
 
 from booster_robotics_sdk_python import RobotMode  # type: ignore
 
+# Optional: GetModeResponse is used to round-trip confirm a ChangeMode
+# actually took effect on the firmware side. If the binding is older and
+# doesn't expose it, ``_change_mode`` falls back to rc-only checking.
+try:
+    from booster_robotics_sdk_python import GetModeResponse  # type: ignore
+    _HAS_GETMODE = True
+except ImportError:  # pragma: no cover
+    _HAS_GETMODE = False
+
 from ..utils.joystick_handler import (
     JoystickHandler,
     BUTTON_B,
     BUTTON_X,
     BUTTON_Y,
 )
+
+
+# SDK RPC status codes — see booster_robotics_sdk/include/booster/robot/
+# rpc/error.hpp. Surfacing the human-readable name in the log is the
+# difference between "huh, why didn't it transition?" and "ah, the
+# firmware rejected with 502 because we tried WALK→CUSTOM."
+_RPC_RC_EXPLAIN = {
+    -1: "rc=-1 Invalid: request never published (Init not called, "
+        "or RpcClient torn down).",
+    0:  "rc=0 Success.",
+    100: "rc=100 Timeout: channel is up but no firmware response in "
+         "1s. Check --net, that the firmware is up, and ROS_DOMAIN_ID.",
+    400: "rc=400 BadRequest: malformed payload (mode enum value rejected).",
+    409: "rc=409 Conflict: firmware in a state that disallows this "
+         "transition (e.g. WALK → CUSTOM directly; must hop via PREP).",
+    429: "rc=429 RequestTooFrequent: throttle — sleep 0.2s between calls.",
+    500: "rc=500 InternalServerError: firmware-side fault.",
+    501: "rc=501 ServerRefused: firmware actively refused this op.",
+    502: "rc=502 StateTransitionFailed: firmware state machine couldn't "
+         "perform this transition (e.g. PROTECT and guards aren't met, "
+         "or `is_recovery_available` is False).",
+}
+
+
+def _explain_rpc_rc(rc: int) -> str:
+    return _RPC_RC_EXPLAIN.get(int(rc), f"rc={rc} (unrecognised status code)")
 
 if TYPE_CHECKING:
     from .booster_robot_controller import BoosterRobotPortal
@@ -150,15 +185,66 @@ class RecoveryStateMachine:
         # Foxglove diagnostic.
         self.portal._publish_recovery_state(new_state.value)
 
-    def _change_mode(self, mode: "RobotMode", label: str) -> bool:
-        """Wrap ``client.ChangeMode`` so we publish ``/nomadz/mode`` and log
-        any failure consistently. Returns True on success.
+    def _change_mode(
+        self, mode: "RobotMode", label: str, verify: bool = True,
+    ) -> bool:
+        """Wrap ``client.ChangeMode``: check the SDK rc, optionally round-trip
+        verify via ``GetMode``, then publish ``/nomadz/mode``.
+
+        ``client.ChangeMode`` is an RPC over Fast DDS (topic
+        ``rt/LocoApiTopic``). Its Python binding returns an int status
+        code — 0 success, non-zero a firmware/RPC failure (see
+        ``_RPC_RC_EXPLAIN`` for the code space). Pre-v2.2 this method
+        *discarded* that rc, which is why the FSM appeared to switch
+        modes while the firmware did nothing.
+
+        If ``verify`` is True and the binding exposes ``GetMode``, we
+        round-trip with the firmware and confirm the reported mode
+        actually matches what we asked for; this catches the case where
+        ChangeMode returned 0 but the firmware silently held its old
+        mode. Adds ~a few ms latency per call, which is fine for the
+        operator-driven mode changes the FSM issues.
+
+        Returns True on confirmed transition, False otherwise.
         """
         try:
-            self.client.ChangeMode(mode)
+            rc = self.client.ChangeMode(mode)
         except Exception as exc:
-            self.logger.error("ChangeMode(%s) failed: %s", label, exc)
+            self.logger.error("ChangeMode(%s) raised: %s", label, exc)
             return False
+        if rc != 0:
+            self.logger.error(
+                "ChangeMode(%s) firmware rejected: %s",
+                label, _explain_rpc_rc(rc))
+            return False
+
+        if verify and _HAS_GETMODE:
+            try:
+                gm = GetModeResponse()
+                gm_rc = self.client.GetMode(gm)
+            except Exception as exc:
+                # We have an rc=0 ChangeMode but the verify path blew up.
+                # Don't fail the transition on that — log loudly, trust
+                # the ChangeMode rc.
+                self.logger.warning(
+                    "GetMode() verify raised after ChangeMode(%s): %s — "
+                    "trusting ChangeMode rc=0", label, exc)
+            else:
+                if gm_rc != 0:
+                    self.logger.warning(
+                        "GetMode() verify after ChangeMode(%s) returned "
+                        "%s; trusting ChangeMode rc=0",
+                        label, _explain_rpc_rc(gm_rc))
+                elif int(gm.mode) != int(mode):
+                    self.logger.error(
+                        "Firmware mode mismatch after ChangeMode(%s): "
+                        "firmware reports mode=%s. Treating as failure.",
+                        label, int(gm.mode))
+                    return False
+                else:
+                    self.logger.info(
+                        "ChangeMode(%s) confirmed by GetMode().", label)
+
         self.portal._publish_mode(label)
         return True
 

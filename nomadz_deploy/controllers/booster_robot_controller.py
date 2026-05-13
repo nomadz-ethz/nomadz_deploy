@@ -26,6 +26,14 @@ from booster_robotics_sdk_python import (  # type: ignore
     RobotMode,
 )
 
+# Optional — older SDK builds may not expose GetMode/GetModeResponse.
+# Used here only for post-ChangeMode verification in the legacy helpers.
+try:
+    from booster_robotics_sdk_python import GetModeResponse  # type: ignore
+    _HAS_GETMODE = True
+except ImportError:  # pragma: no cover
+    _HAS_GETMODE = False
+
 from .controller_cfg import ControllerCfg
 from .base_controller import BaseController, BoosterRobot
 from ..utils.synced_array import SyncedArray
@@ -584,8 +592,37 @@ class BoosterRobotPortal:
         self.low_cmd_publisher.publish(self.low_cmd)
         time.sleep(0.1)
 
-        # change to custom mode
-        self.client.ChangeMode(RobotMode.kCustom)
+        # change to custom mode — rc-checked. SDK ChangeMode returns int
+        # status (0=success). Pre-v2.2 the rc was discarded, which is
+        # exactly how the FSM reached PREP_READY while the firmware was
+        # still in PROTECT/DAMP/PREP and ignored our joint targets.
+        try:
+            rc = self.client.ChangeMode(RobotMode.kCustom)
+        except Exception as exc:
+            self.logger.error(
+                "_ramp_to_prepare_state: ChangeMode(kCustom) raised: %s", exc)
+            return False
+        if rc != 0:
+            self.logger.error(
+                "_ramp_to_prepare_state: ChangeMode(kCustom) rc=%s; "
+                "firmware did NOT enter custom mode. Aborting ramp so "
+                "we don't blast joint targets at a non-listening firmware.",
+                rc)
+            return False
+        # Optional GetMode verification — see recovery_state_machine._change_mode
+        # for the same pattern.
+        if _HAS_GETMODE:
+            try:
+                gm = GetModeResponse()
+                gm_rc = self.client.GetMode(gm)
+                if gm_rc == 0 and int(gm.mode) != int(RobotMode.kCustom):
+                    self.logger.error(
+                        "_ramp_to_prepare_state: ChangeMode(kCustom) rc=0 "
+                        "but firmware reports mode=%s; aborting ramp.",
+                        int(gm.mode))
+                    return False
+            except Exception:
+                pass  # binding doesn't expose it cleanly — best-effort
 
         trans = np.linspace(init_joint_pos, prepare_state.joint_pos, num=500)
         start_time = self.timer.get_time()
@@ -709,17 +746,29 @@ class BoosterRobotPortal:
         we go DAMP → PREP → WALK regardless of the starting state.
         """
         self.logger.info("Safe shutdown: kDamping → kPrepare → kWalking")
-        try:
-            self.client.ChangeMode(RobotMode.kDamping)
-            self._publish_mode("kDamping")
+        for target, label in (
+            (RobotMode.kDamping, "kDamping"),
+            (RobotMode.kPrepare, "kPrepare"),
+            (RobotMode.kWalking, "kWalking"),
+        ):
+            try:
+                rc = self.client.ChangeMode(target)
+            except Exception as exc:
+                self.logger.error(
+                    "Safe shutdown ChangeMode(%s) raised: %s; "
+                    "aborting remaining transitions.", label, exc)
+                return
+            if rc != 0:
+                # Don't pretend on Foxglove that we reached this mode —
+                # only publish on confirmed success. Bail so we don't
+                # try to jump WALK over an un-DAMP'd robot.
+                self.logger.error(
+                    "Safe shutdown ChangeMode(%s) rc=%s; firmware "
+                    "rejected. Stopping shutdown sequence; the robot "
+                    "may still be holding its previous mode.", label, rc)
+                return
+            self._publish_mode(label)
             time.sleep(0.2)
-            self.client.ChangeMode(RobotMode.kPrepare)
-            self._publish_mode("kPrepare")
-            time.sleep(0.2)
-            self.client.ChangeMode(RobotMode.kWalking)
-            self._publish_mode("kWalking")
-        except Exception as exc:
-            self.logger.error("Safe shutdown failed: %s", exc)
 
     # --- Back-compat wrappers ------------------------------------------------
 

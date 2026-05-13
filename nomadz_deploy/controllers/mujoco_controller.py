@@ -1,5 +1,6 @@
 import sys
 import atexit
+import shutil
 from time import sleep
 import select
 import numpy as np
@@ -66,6 +67,35 @@ def render_velocity_bars(
     return "\n".join(lines)
 
 
+def print_right_panel(
+    lines: list[str],
+    *,
+    panel_width: int = 28,
+    top_row: int = 1,
+) -> None:
+    """Print ``lines`` flush-right at the top of the terminal.
+
+    Uses ANSI cursor positioning so the panel sits in its own column band
+    on the right side of the screen and never overlaps the normal stdout
+    stream (joystick velocity bars, command prompts, log messages). Each
+    line is padded/truncated to ``panel_width`` so a shorter line on tick
+    N can't leave stale text from tick N-1 visible. The terminal cursor
+    is saved before drawing and restored after, so the user's input line
+    isn't disturbed. Falls back silently if stdout isn't a tty.
+    """
+    if not sys.stdout.isatty():
+        return
+    cols = shutil.get_terminal_size((80, 24)).columns
+    start_col = max(1, cols - panel_width)
+    out = ["\0337"]  # DECSC: save cursor + attrs
+    for i, line in enumerate(lines):
+        text = line[:panel_width].ljust(panel_width)
+        out.append(f"\033[{top_row + i};{start_col}H{text}")
+    out.append("\0338")  # DECRC: restore cursor + attrs
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
 class MujocoController(BaseController):
     def __init__(self, cfg: ControllerCfg, joystick_enabled: bool = False):
         # Create MuJoCo model before super().__init__ so that policies
@@ -94,41 +124,16 @@ class MujocoController(BaseController):
         self.decimation = self.cfg.mujoco.decimation
 
         self._use_native_pd = bool(self.cfg.mujoco.use_native_pd)
-        # kp_arr = self.robot.joint_stiffness.numpy() #* _DEG_TO_RAD
-        # kd_arr = self.robot.joint_damping.numpy() #* _DEG_TO_RAD
+        # n_act = min(len(self.robot.cfg.joint_names), int(self.mj_model.nu))
+        # self.mj_model.dof_frictionloss[6 : 6 + n_act] = 0.02
+        #    # match training: no passive damping
+        kp_arr = self.robot.joint_stiffness.numpy()
+        kd_arr = self.robot.joint_damping.numpy()
         # n_act = min(len(self.robot.cfg.joint_names), int(self.mj_model.nu))
         # self.mj_model.dof_armature[6 : 6 + n_act] = 0.02
         # self.mj_model.dof_armature[6 + 12] = 0.0   # Left_Hip_Yaw
         # self.mj_model.dof_armature[6 + 18] = 0.0   # Right_Hip_Yaw
-
-        # Implicit PD: rewrite each <motor> actuator into a <position>-style
-        # general actuator with the robot config's kp/kd, and switch the
-        # integrator to MuJoCo's full implicit so both the kp*(ctrl-q) and
-        # -kd*qd terms are folded into the effective mass matrix each step
-        # (matches PhysX/Isaac Lab's implicit-PD math). implicitfast would
-        # only treat the damping term implicitly while leaving the stiffness
-        # term explicit — fine at low gains, but the training-time gains
-        # (kp ≈ 80 on legs) prefer the full implicit integrator.
-        #
-        # A <position> actuator is a <general> with:
-        #   gaintype = fixed   → force_gain = ctrl * gainprm[0]
-        #   biastype = affine  → force_bias = biasprm[0] + biasprm[1]*q + biasprm[2]*qd
-        # so force = kp*(ctrl - q) - kv*qd is encoded as
-        #   gainprm = [kp, 0, 0], biasprm = [0, -kp, -kv].
-        # K1's <motor> tags only set forcerange (output torque saturation);
-        # ctrlrange is unset, so leaving forcerange/forcelimited alone keeps
-        # the original torque limits in effect once ctrl is reinterpreted as
-        # a joint target.
-        # The MJCF <joint damping> values (2 N·m·s/rad legs, 1 arms/head) match
-        # training's kd exactly. They are treated implicitly by MuJoCo's
-        # implicitfast integrator (folded into the mass matrix each step),
-        # mirroring PhysX's implicit drive. The manual PD torque below therefore
-        # uses only the kp term; adding -kd*vel there would double-count damping
-        # and make it explicit instead of implicit.
         if self._use_native_pd:
-            _RAD_TO_DEG = 180.0 / np.pi
-            kp_arr = self.robot.joint_stiffness.numpy() #* _RAD_TO_DEG
-            kd_arr = self.robot.joint_damping.numpy() #* _RAD_TO_DEG
             self.mj_model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
             n_act = min(len(self.robot.cfg.joint_names), int(self.mj_model.nu))
             # self.mj_model.dof_armature[6 : 6 + n_act] = 0.02
@@ -315,6 +320,38 @@ class MujocoController(BaseController):
         mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_ARROW, 0.025,
                              arrow_from, arrow_to)
         viewer.user_scn.ngeom += 1
+
+    def _render_obs_markers(self, viewer) -> None:
+        """Draw markers from ``policy.render_obs_markers()`` into the scene.
+
+        Captured by anything recording the MuJoCo viewer window (in-engine
+        screen recorder, OBS, etc). Silent no-op if the policy doesn't
+        expose the hook.
+        """
+        getter = getattr(self.policy, "render_obs_markers", None)
+        if getter is None:
+            return
+        try:
+            specs = getter()
+        except Exception as e:
+            print(f"render_obs_markers failed: {e}")
+            return
+        for spec in specs:
+            if viewer.user_scn.ngeom >= viewer.user_scn.maxgeom:
+                return
+            pos = np.asarray(spec["pos"], dtype=np.float64)
+            rgba = np.asarray(spec["rgba"], dtype=np.float32)
+            size = float(spec.get("size", 0.04))
+            geom = viewer.user_scn.geoms[viewer.user_scn.ngeom]
+            mujoco.mjv_initGeom(
+                geom,
+                mujoco.mjtGeom.mjGEOM_SPHERE,
+                np.array([size, size, size], dtype=np.float64),
+                pos,
+                np.eye(3, dtype=np.float64).reshape(9),
+                rgba,
+            )
+            viewer.user_scn.ngeom += 1
 
     def set_reference_qpos(
         self,
@@ -682,14 +719,17 @@ class MujocoController(BaseController):
             kp = self.robot.joint_stiffness.numpy()
             kd = self.robot.joint_damping.numpy()
             ctrl_limit = self.robot.effort_limit.numpy()
+            torque_scale = float(self.cfg.mujoco.torque_scale)
             dof_pos = self.mj_data.qpos.astype(np.float32)[7 : 7 + n_dof]
             dof_vel = self.mj_data.qvel.astype(np.float32)[6 : 6 + n_dof]
             for i in range(self.decimation):
-                self.mj_data.ctrl[:n_dof] = np.clip(
-                    kp * (dof_targets - dof_pos) - kd * dof_vel,
-                    -ctrl_limit,
-                    ctrl_limit,
-                )
+                # self.mj_data.ctrl[:n_dof] = np.clip(
+                #     torque_scale * (kp * (dof_targets - dof_pos) - kd * dof_vel),
+                #     -ctrl_limit,
+                #     ctrl_limit,
+                # )
+                self.mj_data.ctrl[:n_dof] = torque_scale * (kp * (dof_targets - dof_pos) - kd * dof_vel)
+
                 mujoco.mj_step(self.mj_model, self.mj_data)
                 dof_pos = self.mj_data.qpos.astype(np.float32)[7 : 7 + n_dof]
                 dof_vel = self.mj_data.qvel.astype(np.float32)[6 : 6 + n_dof]
@@ -803,6 +843,14 @@ class MujocoController(BaseController):
                                 joystick_cfg.vyaw_max,
                             ))
 
+                    # Right-side overlay: policies that expose
+                    # render_obs_panel() (e.g. the dribbling policy) get a
+                    # flush-right text panel showing what the network is
+                    # actually consuming each tick. Sits in its own column
+                    # band so it doesn't fight the joystick velocity bars.
+                    if hasattr(self.policy, 'render_obs_panel'):
+                        print_right_panel(self.policy.render_obs_panel())
+
                     viewer.user_scn.ngeom = 0
                     if self.cfg.mujoco.visualize_reference_ghost:
                         # Render kinematic "ghost" robot from generalized coordinates.
@@ -812,6 +860,7 @@ class MujocoController(BaseController):
                         )
 
                     self._render_command_arrow(viewer)
+                    self._render_obs_markers(viewer)
 
                     self.viewer.cam.lookat[:] = self.mj_data.qpos.astype(np.float32)[0:3]
                     self.viewer.sync()

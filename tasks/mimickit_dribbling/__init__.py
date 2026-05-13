@@ -31,9 +31,9 @@ _policy_log_path = f"{_log_path_stem}_policy" if _log_path_stem else None
 
 
 CONTROL_FREQUENCY_HZ = 30.0
-SIMULATION_FREQUENCY_HZ = 120.0  # 4x substeps: reduces bang-bang contact impulse at kp=4584 N·m/rad
+SIMULATION_FREQUENCY_HZ = 120.0  
 CONTROL_DECIMATION = int(SIMULATION_FREQUENCY_HZ / CONTROL_FREQUENCY_HZ)
-CHECKPOINT_PATH = "models/B024_model.pt"
+CHECKPOINT_PATH = "models/B023_model.pt"
 
 # Trunk height that places K1's zero-pose feet just above the MJCF floor.
 MUJOCO_ZERO_POSE_ROOT_HEIGHT_M = 0.557
@@ -51,6 +51,12 @@ _kp = [v * KP_SCALE for v in _base_kp]
 
 _base_kd = KD_OVERRIDE if KD_OVERRIDE is not None else list(K1_CFG.joint_damping)
 _kd = [v * KD_SCALE for v in _base_kd]
+
+# Uniform multiplier on the per-substep PD torque (explicit-PD path only).
+# B023 trained with torque_scale ~ U[0.95, 1.0] (mean 0.975), so set this to
+# 0.975 to match the training-time mean and avoid running ~2.5% "hotter".
+# 1.0 = no compensation.
+TORQUE_SCALE: float = 1.0
 
 # ---------------------------------------------------------------------------
 # Compose K1 + ball into a single scene MJCF.
@@ -166,6 +172,7 @@ class K1MimicKitDribblingCfg(ControllerCfg):
         decimation=CONTROL_DECIMATION,
         log_states=_mujoco_log_path,
         ground_friction=[1.0, 0.005, 0.0001],
+        torque_scale=TORQUE_SCALE,
         enable_push= False,
         push_force_min=50.0,
         push_force_max=75.0,

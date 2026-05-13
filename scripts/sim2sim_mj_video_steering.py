@@ -91,8 +91,9 @@ def main():
     parser.add_argument("--camera-lookat-height", type=float, default=0.5,
                         help="Fixed world-frame Z height the camera looks at (m). "
                              "Camera tracks robot XY but not its vertical bobbing.")
-    parser.add_argument("--fps", type=int, default=30,
-                        help="Output video fps (one frame per control tick by default)")
+    parser.add_argument("--fps", type=int, default=None,
+                        help="Output video fps (defaults to the control rate so "
+                             "playback is real-time; one frame per control tick)")
     parser.add_argument("--gl", default="egl", choices=["egl", "osmesa", "glfw"])
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
@@ -170,10 +171,14 @@ def main():
     _, cmd_vx, cmd_vy, cmd_omega = schedule[0]
 
     control_hz = 1.0 / ctrl.cfg.policy_dt
-    if abs(control_hz - args.fps) > 1e-3:
+    if args.fps is None:
+        args.fps = int(round(control_hz))
+        print(f"[video] fps not set; defaulting to control rate {args.fps} Hz")
+    elif abs(control_hz - args.fps) > 1e-3:
         print(
             f"[video] note: control rate is {control_hz:.1f} Hz but video fps is "
-            f"{args.fps}; using 1 frame per control tick anyway."
+            f"{args.fps}; using 1 frame per control tick anyway "
+            f"(playback will be {args.fps / control_hz:.2f}× real-time)."
         )
     num_steps = max(1, int(round(total_duration * control_hz)))
     print(

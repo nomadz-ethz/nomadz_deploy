@@ -15,13 +15,30 @@ with warnings.catch_warnings():
 
 import threading
 import time
+from collections import deque
 from typing import Optional, Tuple
 
 
-class JoystickHandler:
-    """Handles Xbox controller input for teleoperation."""
+# Standard Xbox-style pad mapping under Linux/SDL. These are pygame button
+# indices (passed to joystick.get_button(i)). They are empirically validated
+# in step 1.5 of the recovery integration validation plan — if the operator's
+# pad reports different indices, override these via the JoystickHandler ctor.
+BUTTON_A = 0
+BUTTON_B = 1
+BUTTON_X = 2
+BUTTON_Y = 3
 
-    def __init__(self, deadzone: float = 0.1):
+
+class JoystickHandler:
+    """Handles Xbox controller input for teleoperation.
+
+    In addition to the original axis (left stick / right stick X) reads, this
+    handler now polls discrete buttons and exposes a rising-edge consumer
+    (``consume_press``) so callers can implement single-shot reactions to
+    button presses without debouncing the polling rate manually.
+    """
+
+    def __init__(self, deadzone: float = 0.1, num_buttons: int = 10):
         self.deadzone = deadzone
         self.joystick: Optional[pygame.joystick.Joystick] = None
         self.running = False
@@ -37,6 +54,17 @@ class JoystickHandler:
         self.center_left_x = 0.0
         self.center_left_y = 0.0
         self.center_right_x = 0.0
+
+        # Button state. ``_button_prev`` holds the last polled level for each
+        # button; ``_button_pressed_edges`` is a queue of (button_id) entries
+        # for every rising edge that hasn't been consumed yet. consume_press()
+        # drains a specific id from the queue. The lock guards both fields
+        # because update_values() runs on the polling thread and consume_press
+        # is called from the state-machine thread.
+        self._num_buttons = num_buttons
+        self._button_prev = [False] * num_buttons
+        self._button_pressed_edges: deque = deque()
+        self._button_lock = threading.Lock()
 
         self._init_pygame()
 
@@ -114,6 +142,17 @@ class JoystickHandler:
         raw_right_x = self.joystick.get_axis(3)
         self.right_stick_x = self._apply_deadzone(raw_right_x, self.center_right_x)
 
+        # Buttons: rising-edge detection. We poll because pygame's event API
+        # would require draining JOYBUTTONDOWN/UP events from the same queue
+        # we already pump for axis updates, and event.pump() doesn't return
+        # them. get_button() is synchronous and gives us the current level.
+        with self._button_lock:
+            for i in range(self._num_buttons):
+                cur = bool(self.joystick.get_button(i))
+                if cur and not self._button_prev[i]:
+                    self._button_pressed_edges.append(i)
+                self._button_prev[i] = cur
+
     def get_velocities(self, vx_max: float, vy_max: float, vyaw_max: float) -> Tuple[float, float, float]:
         """Get velocity commands from joystick.
 
@@ -133,6 +172,41 @@ class JoystickHandler:
         yaw_vel = -self.right_stick_x * vyaw_max
 
         return forward_vel, lateral_vel, yaw_vel
+
+    def axes(self) -> Tuple[float, float, float]:
+        """Return the latest stick values as ``(vx, vy, vyaw)`` in [-1, 1].
+
+        Same sign convention as ``get_velocities`` (forward is +x, left is +y,
+        CCW yaw is +z) but unscaled — the caller multiplies by per-task limits.
+        """
+        if not self.calibrated:
+            return 0.0, 0.0, 0.0
+        return -self.left_stick_y, -self.left_stick_x, -self.right_stick_x
+
+    def consume_press(self, button_id: int) -> bool:
+        """Return True exactly once per rising edge of ``button_id``.
+
+        Drains the next pending press of ``button_id`` from the edge queue.
+        Other buttons' edges remain queued. Used by the recovery state machine
+        to react to Y/B/X presses without firing repeatedly while held.
+        """
+        with self._button_lock:
+            try:
+                self._button_pressed_edges.remove(button_id)
+                return True
+            except ValueError:
+                return False
+
+    def drain_button_events(self) -> list:
+        """Drain and return all pending press edges as a list of button ids.
+
+        Useful for diagnostic publishers that want to emit a ROS message per
+        button press. Returns an empty list if there are no pending edges.
+        """
+        with self._button_lock:
+            events = list(self._button_pressed_edges)
+            self._button_pressed_edges.clear()
+            return events
 
     def start(self):
         """Start joystick reading thread."""

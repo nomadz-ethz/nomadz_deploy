@@ -25,11 +25,18 @@ class MujocoControllerCfg:
     # bouncy-contact tasks (e.g. dribbling) need True; default-walking
     # tasks like t1_walk run fine with False.
     use_native_pd: bool = False
+
     # physics_dt will automatically be set by ControllerCfg
     physics_dt: float = None  # type: ignore
     # Ground geom friction [sliding, torsional, rolling]. Overrides the
     # MJCF value at load time so deployment is reproducible across assets.
     ground_friction: List[float] = [1.0, 0.005, 0.0001]
+    # Multiplier applied to the PD torque each sub-step (only in the
+    # explicit-PD path; use_native_pd=True ignores this). Compensates for
+    # asymmetric torque_scale randomization at training time — e.g. if the
+    # policy was trained with torque_scale ~ U[0.95, 1.0] (mean 0.975),
+    # set this to 0.975 here so the deploy mean matches training mean.
+    torque_scale: float = 1.0
     log_states: Optional[str] = None
     visualize_reference_ghost: bool = False
     ghost_rgba: List[float] = [0.2, 0.8, 0.2, 0.25]
@@ -81,6 +88,16 @@ class MujocoControllerCfg:
 class BoosterRobotControllerCfg:
     low_state_dt: float = 0.002
     metrics_max_events: int = 2000
+
+    # Recovery state-machine knobs. The portal computes the projected gravity
+    # z-component each low_state tick (gz = -cos(roll)*cos(pitch)) and trips a
+    # fall_event when gz exceeds fall_proj_g_z_threshold for fall_streak_threshold
+    # consecutive ticks. Auto-recovery is intentionally OFF — the detector only
+    # logs/publishes; the operator commits to recovery via a B-press.
+    # See docs/RECOVERY_INTEGRATION_PLAN.md §13 for the v2.1 decisions.
+    fall_proj_g_z_threshold: float = -0.5     # matches LocomotionPolicy default
+    fall_streak_threshold: int = 5            # ~10 ms at 500 Hz low_state rate
+    recover_stable_frames: int = 5            # ~250 ms of upright (proj_g_z < -0.95)
 
 
 @configclass

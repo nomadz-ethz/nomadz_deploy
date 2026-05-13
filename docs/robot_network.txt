@@ -1,0 +1,9 @@
+master@master:~/Playground/booster_robotics_sdk/build$ pip3 install pybind11-stubgen
+Defaulting to user installation because normal site-packages is not writeable
+WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7f5a38e5f2e0>: Failed to establish a new connection: [Errno -3] Temporary failure in name resolution')': /simple/pybind11-stubgen/
+WARNING: Retrying (Retry(total=3, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7f5a38e5f610>: Failed to establish a new connection: [Errno -3] Temporary failure in name resolution')': /simple/pybind11-stubgen/
+WARNING: Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7f5a38e5f7c0>: Failed to establish a new connection: [Errno -3] Temporary failure in name resolution')': /simple/pybind11-stubgen/
+WARNING: Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7f5a38e5f970>: Failed to establish a new connection: [Errno -3] Temporary failure in name resolution')': /simple/pybind11-stubgen/
+WARNING: Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7f5a38e5fb20>: Failed to establish a new connection: [Errno -3] Temporary failure in name resolution')': /simple/pybind11-stubgen/
+ERROR: Could not find a version that satisfies the requirement pybind11-stubgen (from versions: none)
+ERROR: No matching distribution found for pybind11-stubgen

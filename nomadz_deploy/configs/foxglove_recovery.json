@@ -1,0 +1,150 @@
+{
+  "configById": {
+    "Indicator!recovery_state": {
+      "path": "/nomadz/recovery_state.data",
+      "style": "background",
+      "fallbackColor": "#a0a0a0",
+      "fallbackLabel": "(no data)",
+      "rules": [
+        { "operator": "=", "rawValue": "idle",        "color": "#888888", "label": "IDLE" },
+        { "operator": "=", "rawValue": "prep_ready",  "color": "#3b82f6", "label": "PREP_READY" },
+        { "operator": "=", "rawValue": "running",     "color": "#22c55e", "label": "RUNNING" },
+        { "operator": "=", "rawValue": "fallen",      "color": "#dc2626", "label": "FALLEN" },
+        { "operator": "=", "rawValue": "recovering",  "color": "#eab308", "label": "RECOVERING" },
+        { "operator": "=", "rawValue": "staged",      "color": "#3b82f6", "label": "STAGED" },
+        { "operator": "=", "rawValue": "exiting",     "color": "#000000", "label": "EXITING" }
+      ]
+    },
+    "Indicator!mode": {
+      "path": "/nomadz/mode.data",
+      "style": "background",
+      "fallbackColor": "#a0a0a0",
+      "fallbackLabel": "(no mode)",
+      "rules": [
+        { "operator": "=", "rawValue": "kDamping",  "color": "#888888", "label": "DAMP" },
+        { "operator": "=", "rawValue": "kPrepare",  "color": "#3b82f6", "label": "PREP" },
+        { "operator": "=", "rawValue": "kWalking",  "color": "#22c55e", "label": "WALK" },
+        { "operator": "=", "rawValue": "kCustom",   "color": "#a855f7", "label": "CUSTOM" }
+      ]
+    },
+    "Indicator!fall_flag": {
+      "path": "/nomadz/fall_flag.data",
+      "style": "background",
+      "fallbackColor": "#22c55e",
+      "fallbackLabel": "OK",
+      "rules": [
+        { "operator": "=", "rawValue": "true",  "color": "#dc2626", "label": "FALL DETECTED" },
+        { "operator": "=", "rawValue": "false", "color": "#22c55e", "label": "OK" }
+      ]
+    },
+    "Indicator!getup_rc": {
+      "path": "/nomadz/getup_return_code.data",
+      "style": "background",
+      "fallbackColor": "#a0a0a0",
+      "fallbackLabel": "(no GetUp yet)",
+      "rules": [
+        { "operator": "=", "rawValue": "0", "color": "#22c55e", "label": "GetUp OK (0)" }
+      ]
+    },
+    "Plot!proj_g_z": {
+      "title": "proj_g_z (fall threshold = -0.5)",
+      "paths": [
+        { "value": "/nomadz/proj_g_z.data",  "enabled": true, "label": "proj_g_z", "color": "#dc2626", "timestampMethod": "receiveTime" }
+      ],
+      "minYValue": -1.1,
+      "maxYValue": 0.5,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 20
+    },
+    "Plot!imu_rpy": {
+      "title": "IMU roll/pitch/yaw (rad)",
+      "paths": [
+        { "value": "/nomadz/imu_rpy.x", "enabled": true, "label": "roll",  "color": "#dc2626", "timestampMethod": "receiveTime" },
+        { "value": "/nomadz/imu_rpy.y", "enabled": true, "label": "pitch", "color": "#22c55e", "timestampMethod": "receiveTime" },
+        { "value": "/nomadz/imu_rpy.z", "enabled": true, "label": "yaw",   "color": "#3b82f6", "timestampMethod": "receiveTime" }
+      ],
+      "minYValue": -3.2,
+      "maxYValue": 3.2,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 20
+    },
+    "Plot!joystick_axes": {
+      "title": "Operator joystick axes",
+      "paths": [
+        { "value": "/nomadz/joystick_axes.x", "enabled": true, "label": "vx",   "color": "#dc2626", "timestampMethod": "receiveTime" },
+        { "value": "/nomadz/joystick_axes.y", "enabled": true, "label": "vy",   "color": "#22c55e", "timestampMethod": "receiveTime" },
+        { "value": "/nomadz/joystick_axes.z", "enabled": true, "label": "vyaw", "color": "#3b82f6", "timestampMethod": "receiveTime" }
+      ],
+      "minYValue": -1.1,
+      "maxYValue": 1.1,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 20
+    },
+    "RawMessages!button_events": {
+      "topicPath": "/nomadz/button_events.data",
+      "diffMethod": "custom",
+      "fontSize": 14
+    },
+    "RawMessages!recovery_log": {
+      "topicPath": "/nomadz/recovery_state.data",
+      "diffMethod": "custom",
+      "fontSize": 14
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": { "speed": 1 },
+  "layout": {
+    "direction": "column",
+    "splitPercentage": 18,
+    "first": {
+      "direction": "row",
+      "splitPercentage": 25,
+      "first": "Indicator!recovery_state",
+      "second": {
+        "direction": "row",
+        "splitPercentage": 33,
+        "first": "Indicator!mode",
+        "second": {
+          "direction": "row",
+          "splitPercentage": 50,
+          "first": "Indicator!fall_flag",
+          "second": "Indicator!getup_rc"
+        }
+      }
+    },
+    "second": {
+      "direction": "column",
+      "splitPercentage": 50,
+      "first": {
+        "direction": "row",
+        "splitPercentage": 50,
+        "first": "Plot!proj_g_z",
+        "second": "Plot!imu_rpy"
+      },
+      "second": {
+        "direction": "row",
+        "splitPercentage": 50,
+        "first": "Plot!joystick_axes",
+        "second": {
+          "direction": "column",
+          "splitPercentage": 50,
+          "first": "RawMessages!button_events",
+          "second": "RawMessages!recovery_log"
+        }
+      }
+    }
+  }
+}

@@ -212,6 +212,20 @@ class DribblingPolicy(JitPolicy):
             [self._ball_history_len, 2], dtype=torch.float32
         )
 
+        # Parallel world-frame XYZ history used purely for the in-viewer
+        # marker trail (so it shows up in screen recordings of the MuJoCo
+        # window). NaN means the entry was out-of-view -> skipped at render
+        # time. Shifted in lockstep with _ball_pos_history.
+        self._ball_pos_history_world = np.full(
+            (self._ball_history_len, 3), np.nan, dtype=np.float32
+        )
+
+        # Cached scalars from the most recent compute_observation() so the
+        # MuJoCo controller can render them in the on-screen obs panel
+        # without recomputing the FOV check.
+        self._last_is_in_view: float = 0.0
+        self._last_local_tar_dir: torch.Tensor = torch.zeros(2, dtype=torch.float32)
+
         # Steering command state.
         self._target_direction_world_xy = torch.tensor(
             DEFAULT_TARGET_DIRECTION_WORLD_XY, dtype=torch.float32
@@ -254,6 +268,7 @@ class DribblingPolicy(JitPolicy):
     def reset(self) -> None:
         super().reset()
         self._ball_pos_history.zero_()
+        self._ball_pos_history_world[:] = np.nan
         self._spawn_ball()
 
     def _spawn_ball(self) -> None:
@@ -336,6 +351,14 @@ class DribblingPolicy(JitPolicy):
         self._ball_pos_history[0] = new_entry
         ball_history_flat = self._ball_pos_history.reshape(-1)
 
+        # World-frame mirror for the in-viewer marker trail. NaN when the
+        # FOV gate dropped the entry, so the renderer can skip it.
+        self._ball_pos_history_world[1:] = self._ball_pos_history_world[:-1]
+        if is_in_view > 0.5:
+            self._ball_pos_history_world[0] = ball_pos_w.detach().cpu().numpy()
+        else:
+            self._ball_pos_history_world[0] = np.nan
+
         # Target dir in heading frame.
         tar_dir_3d = _append_zero_z(self._target_direction_world_xy)
         local_tar_dir = _quat_rotate_xyzw(
@@ -343,6 +366,10 @@ class DribblingPolicy(JitPolicy):
         ).squeeze(0)[:2]
 
         in_view_obs = torch.tensor([1.0 if is_in_view > 0.5 else 0.0])
+
+        # Cache for the on-screen obs panel.
+        self._last_is_in_view = float(is_in_view)
+        self._last_local_tar_dir = local_tar_dir.detach().clone()
 
         return torch.cat([
             gravity_body,                   # 3
@@ -377,6 +404,91 @@ class DribblingPolicy(JitPolicy):
         if abs(u) > self._fov_max_u or abs(v) > self._fov_max_v:
             return 0.0
         return 1.0
+
+    # --- In-viewer marker trail (shows up in screen recordings) ---
+
+    def render_obs_markers(self) -> list[dict]:
+        """Return marker specs for the controller to add to ``user_scn``.
+
+        Each spec is ``{"pos": (x,y,z), "rgba": (r,g,b,a), "size": s}`` and
+        draws as a small sphere. The trail visualizes the world positions
+        the policy's heading-frame ball-history *was sampled from* — so
+        what you see in the recording is the same data feeding the 30-D
+        ball-history slice of the obs vector. NaN entries (out-of-view)
+        are dropped so gaps in the trail correspond to gaps in the obs.
+
+        A separate marker just above the trunk encodes ``is_in_view``:
+        green when the FOV gate is open this tick, red when it's closed.
+        """
+        markers: list[dict] = []
+        n = self._ball_pos_history_world.shape[0]
+        for i in range(n):
+            pos = self._ball_pos_history_world[i]
+            if not np.isfinite(pos).all():
+                continue
+            # Recency: 0=newest, 1=oldest. Green -> red gradient.
+            t = i / max(1, n - 1)
+            r = float(t)
+            g = float(1.0 - t)
+            b = 0.0
+            a = float(0.85 - 0.55 * t)        # fade older entries
+            size = float(0.045 - 0.022 * t)   # shrink older entries
+            markers.append({
+                "pos": (float(pos[0]), float(pos[1]), float(pos[2])),
+                "rgba": (r, g, b, a),
+                "size": size,
+            })
+
+        # In-view indicator above the trunk. Read trunk pos from the
+        # controller (it owns mj_data); fall back to the latest ball if
+        # not available so we always emit something visible.
+        try:
+            trunk_xyz = self.controller.mj_data.qpos[0:3].copy()
+            indicator_pos = (
+                float(trunk_xyz[0]),
+                float(trunk_xyz[1]),
+                float(trunk_xyz[2]) + 0.55,  # ~head height above root
+            )
+        except Exception:
+            indicator_pos = (0.0, 0.0, 1.2)
+        in_view = self._last_is_in_view > 0.5
+        markers.append({
+            "pos": indicator_pos,
+            "rgba": (0.1, 0.9, 0.1, 0.95) if in_view else (0.95, 0.1, 0.1, 0.95),
+            "size": 0.05,
+        })
+        return markers
+
+    # --- Right-side terminal overlay ---
+
+    def render_obs_panel(self) -> list[str]:
+        """Format the ball observation buffer for the on-screen overlay.
+
+        Returns a list of fixed-width lines that the MuJoCo controller
+        positions at the top-right of the terminal each frame. Mirrors the
+        30-D ball-history slice + 2-D local target dir + 1-D target speed
+        + 1-D in-view flag that the policy actually consumes, so what you
+        see on screen is exactly what the network sees.
+        """
+        history_np = self._ball_pos_history.detach().cpu().numpy()  # (N, 2)
+        in_view = self._last_is_in_view > 0.5
+        local_tar = self._last_local_tar_dir.detach().cpu().numpy()
+        tar_speed = float(self._target_speed_mps.item())
+
+        lines: list[str] = []
+        lines.append("── Ball Observation ──")
+        lines.append(f" in_view : {'YES' if in_view else ' no'}")
+        lines.append(f" loc_dir : {local_tar[0]:+.2f}, {local_tar[1]:+.2f}")
+        lines.append(f" tar_spd : {tar_speed:+.2f} m/s")
+        lines.append("")
+        lines.append(" history (heading XY)")
+        lines.append(" newest-> oldest")
+        lines.append(" idx    x       y    ")
+        for i, (x, y) in enumerate(history_np):
+            zero = abs(x) < 1e-6 and abs(y) < 1e-6
+            mark = "·" if zero else " "
+            lines.append(f"  {i:>2}  {x:+6.3f} {y:+6.3f} {mark}")
+        return lines
 
     # --- Logging hook ---
 

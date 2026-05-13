@@ -23,7 +23,15 @@ parser.add_argument("--webots", action="store_true", default=False,
                     help="deploy in webots simulation")
 parser.add_argument(
     "--joystick", action="store_true", default=False,
-    help="Enable joystick control for teleoperation")
+    help="Enable joystick control for teleoperation (pygame, our pad).")
+parser.add_argument(
+    "--keyboard", action="store_true", default=False,
+    help=(
+        "Enable keyboard control as an alternative to --joystick. Drives "
+        "the same recovery state machine via stdin: w/s/a/d/q/e/Space for "
+        "axes, y/b/x for buttons. Useful for early bring-up before a pad "
+        "is plugged in. Ignored if --joystick is also set."
+    ))
 parser.add_argument(
     "--vx-max", type=float, default=None,
     help="Override joystick max forward velocity.")
@@ -127,7 +135,12 @@ def main():
                 task_cfg.robot.joint_damping[i] = 0.5
 
         from nomadz_deploy.controllers.booster_robot_controller import BoosterRobotPortal
-        with BoosterRobotPortal(task_cfg, use_sim_time=args.webots) as portal:
+        with BoosterRobotPortal(
+            task_cfg,
+            use_sim_time=args.webots,
+            joystick_enabled=args.joystick,
+            keyboard_enabled=args.keyboard,
+        ) as portal:
             portal.run()
 
 

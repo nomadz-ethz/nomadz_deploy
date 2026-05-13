@@ -14,6 +14,13 @@ from rclpy.executors import SingleThreadedExecutor, ExternalShutdownException
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from booster_interface.msg import LowState, LowCmd, MotorCmd
 
+# Diagnostic publishers (Foxglove visualisation; see docs §8). Imported at
+# module level because rclpy is already a hard dependency and these are
+# standard ROS 2 packages — if either isn't available, the deployment was
+# already broken.
+from std_msgs.msg import Bool, Float32, Int32, String
+from geometry_msgs.msg import Vector3
+
 from booster_robotics_sdk_python import (  # type: ignore
     B1LocoClient,
     RobotMode,
@@ -25,6 +32,8 @@ from ..utils.synced_array import SyncedArray
 from ..utils.metrics import SyncedMetrics
 from ..utils.isaaclab import math as lab_math
 from ..utils.remote_control_service import RemoteControlService
+from ..utils.joystick_handler import JoystickHandler
+from ..utils.keyboard_handler import KeyboardHandler
 
 
 logger = logging.getLogger("booster_deploy")
@@ -58,7 +67,13 @@ class BoosterRobotPortal:
     synced_action: SyncedArray
     exit_event: synchronize.Event
 
-    def __init__(self, cfg: ControllerCfg, use_sim_time: bool = False) -> None:
+    def __init__(
+        self,
+        cfg: ControllerCfg,
+        use_sim_time: bool = False,
+        joystick_enabled: bool = False,
+        keyboard_enabled: bool = False,
+    ) -> None:
         self.cfg = cfg
 
         self.robot = BoosterRobot(cfg.robot)
@@ -67,11 +82,71 @@ class BoosterRobotPortal:
         self.logger = logging.getLogger(__name__)
 
         self.remoteControlService = RemoteControlService()
+
+        # Operator-input handler that drives the recovery state machine.
+        # Two interchangeable backends, both implementing the
+        # JoystickHandler-shape interface (axes / consume_press / start /
+        # stop / calibrate):
+        #
+        #   - JoystickHandler — pygame, our own external controller plugged
+        #     into the host's USB. Production path.
+        #   - KeyboardHandler — stdin/cbreak, useful before a pad is
+        #     available (early bring-up, sim runs over SSH). Same FSM,
+        #     same buttons; just slower to drive.
+        #
+        # The two flags are mutually exclusive; if both are passed the
+        # joystick wins (it's the more deliberate choice for hardware).
+        # See docs/RECOVERY_INTEGRATION_PLAN.md §4 for the two-controllers
+        # split (manufacturer's evdev pad vs. ours).
+        self.joystick_enabled = bool(joystick_enabled)
+        self.keyboard_enabled = bool(keyboard_enabled) and not self.joystick_enabled
+        self.joystick_handler: "JoystickHandler | KeyboardHandler | None" = None
+        if self.joystick_enabled:
+            try:
+                self.joystick_handler = JoystickHandler()
+                self.joystick_handler.calibrate()
+                self.joystick_handler.start()
+                self.logger.info("JoystickHandler enabled and calibrated.")
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to initialise JoystickHandler (%s); falling back "
+                    "to RemoteControlService.", exc)
+                self.joystick_enabled = False
+                self.joystick_handler = None
+        elif self.keyboard_enabled:
+            try:
+                self.joystick_handler = KeyboardHandler()
+                self.joystick_handler.calibrate()
+                self.joystick_handler.start()
+                self.logger.info("KeyboardHandler enabled (cbreak stdin).")
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to initialise KeyboardHandler (%s); falling back "
+                    "to RemoteControlService.", exc)
+                self.keyboard_enabled = False
+                self.joystick_handler = None
+
         # Use multiprocessing.Event for inter-process communication
         self.exit_event = mp.Event()
+        # Gates the inference subprocess's publish loop. set() = run, clear()
+        # = pause without termination (used by the X-press emergency-damp path
+        # in the recovery state machine). The subprocess inherits this Event
+        # because we set() it before forking.
+        self.policy_run_event = mp.Event()
+        self.policy_run_event.set()
         self.is_running = True
         self.timer = CountTimer(
             self.cfg.booster.low_state_dt, use_sim_time=use_sim_time)
+
+        # Fall-detection state. Updated on the low_state subscription thread;
+        # consumed by the recovery state machine on the main thread. Only
+        # logs/publishes by default — auto-recovery is intentionally OFF
+        # (see docs §13.6); the operator commits via a B-press.
+        self._fall_event = threading.Event()
+        self._fall_streak = 0
+        # Cached projected-gravity-z so _wait_until_upright() can poll it
+        # without re-decoding the IMU each tick.
+        self._proj_g_z: float = -1.0
 
         def signal_handler(sig, frame):
             if mp.current_process().name == "MainProcess":
@@ -158,10 +233,143 @@ class BoosterRobotPortal:
             self.client = B1LocoClient()
             self.create_low_cmd_publisher("booster_deploy_low_cmd_pub")
             self._start_low_state_subscription()
+            self._init_diagnostics()
             self.client.Init()
         except Exception as e:
             self.logger.error(f"Failed to initialize communication: {e}")
             raise
+
+    def _init_diagnostics(self) -> None:
+        """Stand up the ``/nomadz/*`` diagnostic publishers (see docs §8).
+
+        Publishers don't need their node spun (only subscribers/timers do),
+        so we don't run an executor for this node — we just keep it alive
+        and call ``publish()`` from whichever thread produces the message
+        (low_state callback, joystick poll thread, recovery FSM). rclpy's
+        ``Publisher.publish`` is thread-safe.
+        """
+        self._diag_node = rclpy.create_node("nomadz_diagnostics")
+        # Burst-only events get RELIABLE so we never miss a state transition;
+        # high-rate streams get BEST_EFFORT/depth=1 so they never queue up.
+        qos_event = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        qos_stream = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self._pub_recovery_state = self._diag_node.create_publisher(
+            String, "/nomadz/recovery_state", qos_event)
+        self._pub_mode = self._diag_node.create_publisher(
+            String, "/nomadz/mode", qos_event)
+        self._pub_proj_g_z = self._diag_node.create_publisher(
+            Float32, "/nomadz/proj_g_z", qos_stream)
+        self._pub_fall_flag = self._diag_node.create_publisher(
+            Bool, "/nomadz/fall_flag", qos_event)
+        self._pub_joystick_axes = self._diag_node.create_publisher(
+            Vector3, "/nomadz/joystick_axes", qos_stream)
+        self._pub_button_events = self._diag_node.create_publisher(
+            String, "/nomadz/button_events", qos_event)
+        self._pub_imu_rpy = self._diag_node.create_publisher(
+            Vector3, "/nomadz/imu_rpy", qos_stream)
+        self._pub_getup_rc = self._diag_node.create_publisher(
+            Int32, "/nomadz/getup_return_code", qos_event)
+
+        # Joystick axes thread (50 Hz). Skipped when no input handler is
+        # enabled so the topic just stays silent on legacy runs. Joystick
+        # and keyboard backends share the same diag publisher path.
+        self._diag_thread: threading.Thread | None = None
+        if self.joystick_handler is not None:
+            self._diag_thread = threading.Thread(
+                target=self._diag_loop,
+                name="nomadz_diag",
+                daemon=True,
+            )
+            self._diag_thread.start()
+
+        # Track previous fall_flag so the low_state handler only publishes on
+        # rising/falling edges (saves bandwidth and gives Foxglove a clean
+        # step trace).
+        self._last_fall_flag_published = False
+
+    # ------------------------------------------------------------------
+    # Diagnostic publish helpers — safe to call from any thread.
+    # ------------------------------------------------------------------
+
+    def _publish_recovery_state(self, name: str) -> None:
+        msg = String()
+        msg.data = name
+        self._pub_recovery_state.publish(msg)
+
+    def _publish_mode(self, name: str) -> None:
+        msg = String()
+        msg.data = name
+        self._pub_mode.publish(msg)
+
+    def _publish_proj_g_z(self, value: float) -> None:
+        msg = Float32()
+        msg.data = float(value)
+        self._pub_proj_g_z.publish(msg)
+
+    def _publish_fall_flag(self, value: bool) -> None:
+        msg = Bool()
+        msg.data = bool(value)
+        self._pub_fall_flag.publish(msg)
+
+    def _publish_joystick_axes(self, vx: float, vy: float, vyaw: float) -> None:
+        msg = Vector3()
+        msg.x = float(vx)
+        msg.y = float(vy)
+        msg.z = float(vyaw)
+        self._pub_joystick_axes.publish(msg)
+
+    def _publish_button_event(self, name: str) -> None:
+        msg = String()
+        msg.data = name
+        self._pub_button_events.publish(msg)
+
+    def _publish_imu_rpy(self, roll: float, pitch: float, yaw: float) -> None:
+        msg = Vector3()
+        msg.x = float(roll)
+        msg.y = float(pitch)
+        msg.z = float(yaw)
+        self._pub_imu_rpy.publish(msg)
+
+    def _publish_getup_return_code(self, rc: int) -> None:
+        msg = Int32()
+        msg.data = int(rc)
+        self._pub_getup_rc.publish(msg)
+
+    def _diag_loop(self) -> None:
+        """Pump joystick axes onto ``/nomadz/joystick_axes`` at 50 Hz.
+
+        Mode and per-press button events are published from the state
+        machine itself (it knows when it issues a ChangeMode and when it
+        consumes a press), so this loop only handles the continuous
+        joystick stream.
+        """
+        period = 0.02  # 50 Hz
+        next_t = time.monotonic()
+        while not self.exit_event.is_set():
+            try:
+                if (
+                    self.joystick_handler is not None
+                    and self.joystick_handler.calibrated
+                ):
+                    vx, vy, vyaw = self.joystick_handler.axes()
+                    self._publish_joystick_axes(vx, vy, vyaw)
+            except Exception as exc:
+                self.logger.debug("diag_loop joystick publish failed: %s", exc)
+
+            next_t += period
+            sleep_for = next_t - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                next_t = time.monotonic()
 
     def _start_low_state_subscription(self) -> None:
         """Start ROS 2 subscription loop on a dedicated thread.
@@ -252,11 +460,55 @@ class BoosterRobotPortal:
             self._state_buf[0]["feedback_torque"][:] = fb_torque
             self.synced_state.write(self._state_buf)
 
-            # update velocity commands to synced_command
+            # IMU-based fall detector. proj_g_z is the world-down vector
+            # rotated into the body frame; for an upright robot it sits near
+            # -1.0, and on a fall it climbs toward 0 or above. Closed-form
+            # equivalent to LocomotionPolicy.compute_observation's
+            # quat_apply_inverse(quat, [0,0,-1]) but cheap to compute here
+            # without converting to torch. See docs §6 ("Fall detection").
+            roll, pitch = float(rpy[0]), float(rpy[1])
+            yaw = float(rpy[2])
+            proj_g_z = -float(np.cos(roll) * np.cos(pitch))
+            self._proj_g_z = proj_g_z
+            cfg_b = self.cfg.booster
+            if proj_g_z > cfg_b.fall_proj_g_z_threshold:
+                self._fall_streak += 1
+                if self._fall_streak >= cfg_b.fall_streak_threshold:
+                    if not self._fall_event.is_set():
+                        self.logger.warning(
+                            "Fall detected (proj_g_z=%.3f > %.3f for %d ticks). "
+                            "Auto-recovery is OFF — operator must press B.",
+                            proj_g_z, cfg_b.fall_proj_g_z_threshold,
+                            self._fall_streak,
+                        )
+                        self._fall_event.set()
+            else:
+                self._fall_streak = 0
+
+            # Diagnostic publishers. proj_g_z and imu_rpy stream every tick
+            # (cheap small messages). fall_flag only emits on level changes
+            # so Foxglove gets a clean step trace.
+            self._publish_proj_g_z(proj_g_z)
+            self._publish_imu_rpy(roll, pitch, yaw)
+            cur_fall = self._fall_event.is_set()
+            if cur_fall != self._last_fall_flag_published:
+                self._publish_fall_flag(cur_fall)
+                self._last_fall_flag_published = cur_fall
+
+            # update velocity commands to synced_command. When our own input
+            # handler (joystick OR keyboard) is enabled it overrides the
+            # manufacturer's RemoteControlService; otherwise legacy
+            # behaviour stands.
             cmd = np.zeros((1,), dtype=self.synced_command.dtype)
-            cmd[0]["vx"] = self.remoteControlService.get_vx_cmd()
-            cmd[0]["vy"] = self.remoteControlService.get_vy_cmd()
-            cmd[0]["vyaw"] = self.remoteControlService.get_vyaw_cmd()
+            if self.joystick_handler is not None:
+                vx, vy, vyaw = self.joystick_handler.axes()
+                cmd[0]["vx"] = vx
+                cmd[0]["vy"] = vy
+                cmd[0]["vyaw"] = vyaw
+            else:
+                cmd[0]["vx"] = self.remoteControlService.get_vx_cmd()
+                cmd[0]["vy"] = self.remoteControlService.get_vy_cmd()
+                cmd[0]["vyaw"] = self.remoteControlService.get_vyaw_cmd()
             self.synced_command.write(cmd)
 
         except Exception as e:
@@ -295,21 +547,32 @@ class BoosterRobotPortal:
 
         return publisher
 
-    def start_custom_mode_conditionally(self):
-        print(f"{self.remoteControlService.get_custom_mode_operation_hint()}")
-        while not self.exit_event.is_set():
-            if self.remoteControlService.start_custom_mode():
-                break
-            time.sleep(0.1)
+    # ------------------------------------------------------------------
+    # Portal helpers for the recovery state machine.
+    #
+    # The legacy entry points `start_custom_mode_conditionally` and
+    # `start_rl_gait_conditionally` are preserved as back-compat wrappers
+    # that wait for a manufacturer-controller button then call into the
+    # underlying helpers. The recovery state machine in
+    # `recovery_state_machine.py` calls the helpers directly so it can
+    # drive its own button source (our pygame JoystickHandler).
+    # ------------------------------------------------------------------
 
-        if self.exit_event.is_set():
-            return False
+    def _ramp_to_prepare_state(self) -> bool:
+        """Ramp the robot from its current pose to the cfg's prepare-state pose
+        and switch into ``kCustom`` mode. Idempotent-safe: callable from any
+        firmware mode reachable from the current state (DAMP/PREP/CUSTOM).
 
+        Returns True if the ramp completed, False if exit_event was set
+        partway through.
+        """
         while rclpy.ok() and self.low_cmd_publisher.get_subscription_count() == 0:
             self.logger.info("Waiting for '/joint_ctrl' subscriber, retry in 0.5s")
             time.sleep(0.5)
+            if self.exit_event.is_set():
+                return False
 
-        self.logger.info("Subscriber found, starting control loop")        
+        self.logger.info("Subscriber found, starting control loop")
 
         prepare_state = self.robot.cfg.prepare_state
         init_joint_pos = self.synced_state.read()[0]['joint_pos']
@@ -323,18 +586,12 @@ class BoosterRobotPortal:
 
         # change to custom mode
         self.client.ChangeMode(RobotMode.kCustom)
-        # for i in range(20):  # try multiple times to make sure mode is changed
-        #     self.client.ChangeMode(RobotMode.kCustom)
-        #     time.sleep(0.5)
-        #     if (mode:= self.client.GetStatus().current_mode) == RobotMode.kCustom:
-        #         break
-        # else:
-        #     self.logger.error("Failed to switch to custom mode")
-        #     return False
 
         trans = np.linspace(init_joint_pos, prepare_state.joint_pos, num=500)
         start_time = self.timer.get_time()
         for i in range(500):
+            if self.exit_event.is_set():
+                return False
             for j in range(self.robot.num_joints):
                 self.motor_cmd[j].q = trans[i][j]
             self.low_cmd_publisher.publish(self.low_cmd)
@@ -343,31 +600,158 @@ class BoosterRobotPortal:
         self.logger.info("Custom mode started, initialized with prepare pose")
         return True
 
+    def _spawn_inference(self) -> bool:
+        """Fork the inference subprocess and start the policy loop.
+
+        Idempotent: if the subprocess is already alive this just makes sure
+        ``policy_run_event`` is set (resuming a pause from the X-press path).
+        On a fresh spawn, sets the event before fork so the child starts
+        publishing immediately. After a fall-recovery the previous subprocess
+        has been terminated and a fresh one is forked here, giving the policy
+        a clean ``obs_history`` and ``last_action``.
+        """
+        # Ensure the run gate is open. Two cases this matters in:
+        #   * Fresh spawn — child inherits set() event and runs.
+        #   * Idempotent call after a pause — flips event so the existing
+        #     subprocess unblocks.
+        self.policy_run_event.set()
+
+        if (
+            self.inference_process is not None
+            and self.inference_process.is_alive()
+        ):
+            return True
+
+        self.inference_process = mp.Process(
+            target=BoosterRobotPortal.inference_process_func,
+            args=(self.cfg, self),
+            daemon=True,
+        )
+        self.inference_process.start()
+        self.logger.info("Inference process started (pid=%s)",
+                         self.inference_process.pid)
+        return True
+
+    def _terminate_inference(self, timeout: float = 1.0) -> None:
+        """Terminate the inference subprocess hard. Used on the fall-to-
+        recovery transition so the post-recovery respawn gets a fresh JIT
+        load and a clean policy state. Safe to call when no subprocess is
+        alive.
+        """
+        proc = self.inference_process
+        if proc is None:
+            return
+        if proc.is_alive():
+            self.logger.info("Terminating inference subprocess (pid=%s)…", proc.pid)
+            proc.terminate()
+            proc.join(timeout=timeout)
+            if proc.is_alive():
+                self.logger.warning(
+                    "Inference subprocess did not exit; sending SIGKILL.")
+                proc.kill()
+                proc.join(timeout=timeout)
+        self.inference_process = None
+
+    def _pause_inference(self) -> None:
+        """Pause the inference loop without terminating it.
+
+        The X-press emergency-damp path uses this so the policy doesn't have
+        to re-load the JIT on the way back. The subprocess sits waiting in
+        ``BoosterRobotController.run`` until ``policy_run_event`` is set
+        again (or ``exit_event`` is set, which makes it exit).
+        """
+        self.policy_run_event.clear()
+        self.logger.info("Inference paused (policy_run_event cleared).")
+
+    def _resume_inference(self) -> None:
+        """Resume a previously-paused inference loop. No-op if the subprocess
+        is not alive; in that case the caller should ``_spawn_inference``.
+        """
+        self.policy_run_event.set()
+        self.logger.info("Inference resumed (policy_run_event set).")
+
+    def _wait_until_upright(
+        self,
+        stable_frames: int | None = None,
+        proj_g_z_target: float = -0.95,
+        timeout_s: float = 15.0,
+    ) -> bool:
+        """Block until the IMU reports the robot is reliably upright.
+
+        ``stable_frames`` consecutive low_state ticks must each have
+        ``proj_g_z < proj_g_z_target`` before we conclude recovery has
+        succeeded. Defaults to ``cfg.booster.recover_stable_frames``.
+        Returns False on timeout or exit_event so callers can abort.
+        """
+        if stable_frames is None:
+            stable_frames = self.cfg.booster.recover_stable_frames
+        streak = 0
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.exit_event.is_set():
+                return False
+            if self._proj_g_z < proj_g_z_target:
+                streak += 1
+                if streak >= stable_frames:
+                    return True
+            else:
+                streak = 0
+            time.sleep(0.02)
+        self.logger.warning(
+            "Upright timeout: proj_g_z=%.3f after %.1fs", self._proj_g_z, timeout_s)
+        return False
+
+    def _safe_shutdown(self) -> None:
+        """Walk the robot back to a benign mode through legal mode-transitions.
+
+        Replaces the v1 single-hop ``ChangeMode(kWalking)`` which is rejected
+        from CUSTOM and from PROTECT. DAMP is reachable from every mode, so
+        we go DAMP → PREP → WALK regardless of the starting state.
+        """
+        self.logger.info("Safe shutdown: kDamping → kPrepare → kWalking")
+        try:
+            self.client.ChangeMode(RobotMode.kDamping)
+            self._publish_mode("kDamping")
+            time.sleep(0.2)
+            self.client.ChangeMode(RobotMode.kPrepare)
+            self._publish_mode("kPrepare")
+            time.sleep(0.2)
+            self.client.ChangeMode(RobotMode.kWalking)
+            self._publish_mode("kWalking")
+        except Exception as exc:
+            self.logger.error("Safe shutdown failed: %s", exc)
+
+    # --- Back-compat wrappers ------------------------------------------------
+
+    def start_custom_mode_conditionally(self):
+        """Legacy entry point: wait for the manufacturer-controller's
+        custom-mode button, then ramp into prepare state. Preserved for
+        callers that aren't driven by the recovery state machine.
+        """
+        print(f"{self.remoteControlService.get_custom_mode_operation_hint()}")
+        while not self.exit_event.is_set():
+            if self.remoteControlService.start_custom_mode():
+                break
+            time.sleep(0.1)
+        if self.exit_event.is_set():
+            return False
+        return self._ramp_to_prepare_state()
+
     def start_rl_gait_conditionally(self):
-        """Start RL gait and spawn inference process and publisher thread."""
+        """Legacy entry point: wait for the manufacturer-controller's RL-gait
+        button, then spawn the inference subprocess.
+        """
         print(f"{self.remoteControlService.get_rl_gait_operation_hint()}")
         while not self.exit_event.is_set():
             if self.remoteControlService.start_rl_gait():
                 break
             time.sleep(0.1)
-
         if self.exit_event.is_set():
             return False
-
-        # start inference process (separate process)
-        self.inference_process = mp.Process(
-            target=BoosterRobotPortal.inference_process_func,
-            args=(
-                self.cfg,
-                self,
-            ),
-            daemon=True,
-        )
-        self.inference_process.start()
-        self.logger.info("Inference process started")
-
-        print(f"{self.remoteControlService.get_operation_hint()}")
-        return True
+        ok = self._spawn_inference()
+        if ok:
+            print(f"{self.remoteControlService.get_operation_hint()}")
+        return ok
 
     def cleanup(self) -> None:
         """Clean up resources (idempotent)."""
@@ -417,6 +801,24 @@ class BoosterRobotPortal:
         except Exception as e:
             self.logger.error(f"Error waiting for low state thread: {e}")
 
+        # Diagnostic publisher thread + node teardown (Foxglove layer).
+        try:
+            diag_thread = getattr(self, "_diag_thread", None)
+            if diag_thread is not None and diag_thread.is_alive():
+                diag_thread.join(timeout=1.0)
+            diag_node = getattr(self, "_diag_node", None)
+            if diag_node is not None:
+                diag_node.destroy_node()
+        except Exception as e:
+            self.logger.error(f"Error tearing down diagnostics: {e}")
+
+        # Stop our pygame joystick if we owned it.
+        try:
+            if self.joystick_handler is not None:
+                self.joystick_handler.stop()
+        except Exception as e:
+            self.logger.error(f"Error stopping joystick handler: {e}")
+
         if rclpy.ok():
             rclpy.shutdown()
 
@@ -433,32 +835,57 @@ class BoosterRobotPortal:
             )
 
     def run(self):
-        """Main loop: monitor inference process and diagnostics (10Hz)."""
+        """Main loop. Two paths:
 
+        * **Joystick-enabled** (``--joystick`` from ``scripts/deploy.py``):
+          delegates to :class:`RecoveryStateMachine` for full Y/B/X driven
+          locomotion + recovery. The state machine returns when
+          ``exit_event`` fires; we then route through legal mode transitions
+          via :meth:`_safe_shutdown`.
+
+        * **Legacy** (no joystick): preserves the original linear chain
+          (``start_custom_mode_conditionally`` → ``start_rl_gait_conditionally``
+          → idle until exit) so existing scripts and the manufacturer's
+          controller flow keep working.
+        """
         print("Initialization complete.")
 
-        # start custom mode (interruptible)
+        if self.joystick_handler is not None:
+            # Imported here to avoid a top-level circular import — the state
+            # machine module imports BoosterRobotPortal for typing only.
+            # The FSM accepts either backend (JoystickHandler or
+            # KeyboardHandler) — both implement the same consume_press /
+            # axes / start / stop surface.
+            from .recovery_state_machine import RecoveryStateMachine
+            try:
+                RecoveryStateMachine(self, self.joystick_handler).run()
+            except Exception as exc:
+                self.logger.error(
+                    "Recovery state machine crashed: %s", exc, exc_info=True)
+                self.exit_event.set()
+        else:
+            self._run_legacy()
+
+        # Exit through legal mode transitions regardless of which path ran.
+        self._safe_shutdown()
+
+    def _run_legacy(self) -> None:
+        """Original startup chain. Used when ``--joystick`` is not set."""
         if not self.start_custom_mode_conditionally():
             print("Custom mode initialization cancelled.")
-        # start RL gait (interruptible)
-        elif not self.start_rl_gait_conditionally():
+            return
+        if not self.start_rl_gait_conditionally():
             print("RL gait initialization cancelled.")
-        else:
-            # main loop: wait for exit signal
-            while self.is_running and not self.exit_event.is_set():
-                # check whether the inference process is alive
-                if self.inference_process is not None:
-                    inference_process_alive = self.inference_process.is_alive()
-                    if not inference_process_alive:
-                        self.logger.error("Inference process died unexpectedly")
-                        self.is_running = False
-                        self.exit_event.set()
-                        break
-                time.sleep(0.1)
-
-        # exit and switch to walking mode
-        self.logger.info("Exiting controller, switching to walking mode...")
-        self.client.ChangeMode(RobotMode.kWalking)
+            return
+        # main loop: wait for exit signal
+        while self.is_running and not self.exit_event.is_set():
+            if self.inference_process is not None:
+                if not self.inference_process.is_alive():
+                    self.logger.error("Inference process died unexpectedly")
+                    self.is_running = False
+                    self.exit_event.set()
+                    break
+            time.sleep(0.1)
 
     def __enter__(self) -> BoosterRobotPortal:
         return self
@@ -541,6 +968,16 @@ class BoosterRobotController(BaseController):
             self.start()
             next_inference_time = self.portal.timer.get_time()
             while self.is_running and not self.portal.exit_event.is_set():
+                # Honour the parent's pause gate. When the recovery state
+                # machine clears policy_run_event (e.g. on X-press emergency
+                # damp), we stop publishing without terminating; the parent
+                # later set()s it to resume. We also bail if exit_event fires
+                # while we're paused.
+                if not self.portal.policy_run_event.is_set():
+                    self.portal.policy_run_event.wait(timeout=0.1)
+                    next_inference_time = self.portal.timer.get_time()
+                    continue
+
                 if self.portal.timer.get_time() < next_inference_time:
                     time.sleep(0.0002)
                     continue

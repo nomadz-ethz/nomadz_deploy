@@ -708,6 +708,12 @@ class MujocoController(BaseController):
         def key_callback(keycode):
             if keycode == GLFW_KEY_BACKSPACE:
                 self._pending_reset = True
+            else:
+                # Forward other keys to the policy if it wants them
+                # (e.g. mode switching in the combo task).
+                on_key = getattr(self.policy, "on_key", None)
+                if on_key is not None:
+                    on_key(keycode)
 
         return key_callback
 
@@ -744,17 +750,13 @@ class MujocoController(BaseController):
                     elif hasattr(self.policy, 'tar_dir'):
                         print("  Right Stick: ←→ Yaw Left/Right")
                     print("  Use controller to teleoperate robot.")
-                    print("")
-                    print("")
-                    print("")
-                    print("")
-                    print("")
-                    print("")
-                    print("")
-                    print("")
-                    print("")
-                    print("")
-                    print("")
+                    # Reserve the lines the per-step HUD will rewrite:
+                    # 11 velocity-bar lines + 1 mode line for mode-aware policies.
+                    self._joystick_hud_lines = 11
+                    if hasattr(self.policy, "mode_name"):
+                        self._joystick_hud_lines += 1
+                    for _ in range(self._joystick_hud_lines):
+                        print("")
                     self._joystick_display_initialized = True
                 self.update_state()
                 self.start()
@@ -773,7 +775,9 @@ class MujocoController(BaseController):
                     # Display velocity bars if joystick is enabled
                     if self.joystick_enabled:
                         if self._joystick_display_initialized:
-                            print("\033[11A", end="")
+                            print(f"\033[{self._joystick_hud_lines}A", end="")
+                        if hasattr(self.policy, "mode_name"):
+                            print(f"Mode: {self.policy.mode_name:<40}")
                         if self.vel_command is not None:
                             print(render_velocity_bars(
                                 self.vel_command.lin_vel_x,

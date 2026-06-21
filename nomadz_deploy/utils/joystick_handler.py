@@ -38,7 +38,16 @@ class JoystickHandler:
         self.center_left_y = 0.0
         self.center_right_x = 0.0
 
+        # Button state: current level + latched rising edges, consumed via
+        # consume_button_press(). Filled in after pygame init.
+        self._button_states: list[int] = []
+        self._button_pressed: list[bool] = []
+
         self._init_pygame()
+
+        num_buttons = self.joystick.get_numbuttons() if self.joystick else 0
+        self._button_states = [0] * num_buttons
+        self._button_pressed = [False] * num_buttons
 
     def _init_pygame(self):
         """Initialize pygame and joystick."""
@@ -98,10 +107,21 @@ class JoystickHandler:
 
     def update_values(self):
         """Update joystick values from current readings."""
-        if not self.joystick or not self.calibrated:
+        if not self.joystick:
             return
 
         pygame.event.pump()
+
+        # Buttons work regardless of stick calibration. Latch rising edges
+        # so a press between two consumer polls is never lost.
+        for i in range(len(self._button_states)):
+            cur = self.joystick.get_button(i)
+            if cur and not self._button_states[i]:
+                self._button_pressed[i] = True
+            self._button_states[i] = cur
+
+        if not self.calibrated:
+            return
 
         # Left stick: forward/backward (Y) and left/right (X)
         raw_left_x = self.joystick.get_axis(0)
@@ -133,6 +153,18 @@ class JoystickHandler:
         yaw_vel = -self.right_stick_x * vyaw_max
 
         return forward_vel, lateral_vel, yaw_vel
+
+    def consume_button_press(self, button_index: int) -> bool:
+        """Return True once per rising edge of the given button.
+
+        Xbox-360 layout: A=0, B=1, X=2, Y=3, LB=4, RB=5, Back=6, Start=7.
+        """
+        if button_index >= len(self._button_pressed):
+            return False
+        if self._button_pressed[button_index]:
+            self._button_pressed[button_index] = False
+            return True
+        return False
 
     def start(self):
         """Start joystick reading thread."""
